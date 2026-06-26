@@ -15,10 +15,11 @@ platform :ios do
     )
   end
 
-  # ONE-TIME (run first, via workflow_dispatch): register the App ID in the dev
-  # portal + create the App Store Connect record so TestFlight has a destination.
-  # mytvbox is a NEW bundle id (unlike safebrowser), so skip_devcenter is false.
-  desc 'Create the App ID + App Store Connect record (run once)'
+  # ONE-TIME (run first, via workflow_dispatch): create the App Store Connect
+  # record so TestFlight has a destination. The dev-portal App ID is created
+  # separately (it needs an Apple-ID login / 2FA that an ASC API key can't do),
+  # so skip_devcenter is true here — same posture as safebrowser.
+  desc 'Create the App Store Connect record (run once, after the App ID exists)'
   lane :create_app do
     asc_key # sets the API key in lane context; produce reads it from there
     produce(
@@ -27,7 +28,7 @@ platform :ios do
       language: 'English',
       sku: 'mytvbox-ios',
       skip_itc: false,
-      skip_devcenter: false
+      skip_devcenter: true
     )
   end
 
