@@ -28,6 +28,12 @@ jobs:
         with:
           xcode-version: '26.0' # Capacitor 8 requires Xcode 26+
 
+      # macos-latest images sometimes ship Xcode 26 without the iOS 26 device
+      # platform preinstalled -> archive fails with "iOS 26.0 is not installed".
+      # Fetch it (idempotent if already present).
+      - name: Ensure iOS platform installed
+        run: xcodebuild -downloadPlatform iOS
+
       - uses: actions/setup-node@v4
         with:
           node-version: '22' # Capacitor 8 CLI requires Node >= 22
