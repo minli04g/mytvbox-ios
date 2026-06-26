@@ -34,8 +34,18 @@ CI 在 `macos-latest` 上用 fastlane `match`(私有 certs repo,SSH)+ App Store 
 1. `lane = create_app` — 在开发者门户注册 App ID + 建 App Store Connect 记录。
 2. `lane = init_signing` — 复用已有分发证书 + 为本 bundle id 生成 appstore profile,存入 match repo。
 
-### 3) 日常发布
-推一个 `v*` tag(如 `git tag v0.1.0 && git push --tags`)→ 触发 `beta` lane → 构建并上传 TestFlight。
+### 3) 日常发布(打 tag 即可)
+推一个 `v*` tag → 触发 `beta` lane → 自动 build + 上传 TestFlight。build 号按 CI run number 自增,**无需再碰签名/密钥/App ID**。
+
+```bash
+git tag v0.1.0
+git push --tags
+# 本机若遇到 schannel TLS 报错(Windows),改用 openssl 后端:
+git -c http.sslBackend=openssl push --tags
+```
+
+也可不打 tag,直接手动触发:`gh workflow run ios.yml -R minli04g/mytvbox-ios --ref main -f lane=beta`。
+构建上传后在 App Store Connect → personaltvbox → TestFlight 里 Processing,几分钟后变 Ready to Test。
 
 ## 本地开发(需 macOS)
 ```
