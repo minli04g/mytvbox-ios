@@ -6,3 +6,8 @@ ios/App/App/public/
 .DS_Store
 *.log
 DerivedData/
+
+# local CI secret backup — NEVER commit (plaintext keys)
+ci-secrets.local.json
+*.local.json
+*.secret
