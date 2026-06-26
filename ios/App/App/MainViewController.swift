@@ -1,4 +1,5 @@
 import UIKit
+import WebKit
 import Capacitor
 
 // App-local Capacitor plugins (NativePlayer) are NOT auto-discovered under
@@ -8,5 +9,15 @@ import Capacitor
 class MainViewController: CAPBridgeViewController {
     override func capacitorDidLoad() {
         bridge?.registerPluginInstance(NativePlayerPlugin())
+    }
+
+    // Keep the WebView out of AirPlay entirely. Capacitor's WKWebView defaults to
+    // allowsAirPlayForMediaPlayback = true, so a <video> starting playback pops the
+    // system AirPlay prompt / grabs a previously-selected route (黑屏只投声音).
+    // AirPlay is handled exclusively by the native AVPlayer (NativePlayer plugin),
+    // invoked only when the user taps the AirPlay button.
+    override func webView(with frame: CGRect, configuration: WKWebViewConfiguration) -> WKWebView {
+        configuration.allowsAirPlayForMediaPlayback = false
+        return super.webView(with: frame, configuration: configuration)
     }
 }
