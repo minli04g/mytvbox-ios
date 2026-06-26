@@ -1,0 +1,55 @@
+name: iOS TestFlight
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      lane:
+        description: 'fastlane lane to run'
+        required: true
+        default: 'beta'
+        type: choice
+        options: [beta, create_app, init_signing]
+
+jobs:
+  ios:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Loads the per-repo deploy key so fastlane match can clone/push the
+      # private certs repo over SSH (also adds github.com to known_hosts).
+      - uses: webfactory/ssh-agent@v0.9.1
+        with:
+          ssh-private-key: ${{ secrets.MATCH_SSH_KEY }}
+
+      - uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: '26.0' # Capacitor 8 requires Xcode 26+
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22' # Capacitor 8 CLI requires Node >= 22
+          cache: npm
+      - run: npm ci
+      - run: npx cap sync ios
+
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.3'
+          bundler-cache: true
+
+      - name: Prepare Xcode project (register native plugin + build number)
+        run: bundle exec ruby scripts/prepare-xcode.rb
+        env:
+          BUILD_NUMBER: ${{ github.run_number }}
+
+      - name: Fastlane ${{ github.event.inputs.lane || 'beta' }}
+        run: bundle exec fastlane ${{ github.event.inputs.lane || 'beta' }}
+        env:
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          ASC_KEY_CONTENT: ${{ secrets.ASC_KEY_CONTENT }}
+          MATCH_PASSWORD: ${{ secrets.MATCH_PASSWORD }}
+          MATCH_GIT_URL: ${{ secrets.MATCH_GIT_URL }}

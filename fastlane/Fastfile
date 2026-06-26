@@ -1,0 +1,72 @@
+default_platform(:ios)
+
+APP_ID = 'top.fancytech.mytvbox'
+TEAM_ID = 'C9DKTHSYYB'
+PROFILE = 'match AppStore top.fancytech.mytvbox'
+
+platform :ios do
+  def asc_key
+    app_store_connect_api_key(
+      key_id: ENV['ASC_KEY_ID'],
+      issuer_id: ENV['ASC_ISSUER_ID'],
+      key_content: ENV['ASC_KEY_CONTENT'], # base64 of the .p8
+      is_key_content_base64: true,
+      in_house: false
+    )
+  end
+
+  # ONE-TIME (run first, via workflow_dispatch): register the App ID in the dev
+  # portal + create the App Store Connect record so TestFlight has a destination.
+  # mytvbox is a NEW bundle id (unlike safebrowser), so skip_devcenter is false.
+  desc 'Create the App ID + App Store Connect record (run once)'
+  lane :create_app do
+    asc_key # sets the API key in lane context; produce reads it from there
+    produce(
+      app_identifier: APP_ID,
+      app_name: 'mytvbox',
+      language: 'English',
+      sku: 'mytvbox-ios',
+      skip_itc: false,
+      skip_devcenter: false
+    )
+  end
+
+  # ONE-TIME (run second): create the distribution cert (reused if it already
+  # exists in the match repo) + an appstore profile for this bundle id, stored
+  # encrypted in the private match repo over SSH.
+  desc 'Initialize signing in the match repo (run once, after create_app)'
+  lane :init_signing do
+    setup_ci
+    match(type: 'appstore', app_identifier: APP_ID, api_key: asc_key, readonly: false)
+  end
+
+  desc 'Build and upload to TestFlight'
+  lane :beta do
+    api_key = asc_key
+    setup_ci
+    match(type: 'appstore', app_identifier: APP_ID, api_key: api_key, readonly: true)
+    # Capacitor defaults to automatic signing; switch to manual with the
+    # match-provisioned profile so the ephemeral runner reuses the stored cert.
+    update_code_signing_settings(
+      path: 'ios/App/App.xcodeproj',
+      use_automatic_signing: false,
+      team_id: TEAM_ID,
+      code_sign_identity: 'Apple Distribution',
+      bundle_identifier: APP_ID,
+      profile_name: PROFILE,
+      targets: ['App']
+    )
+    build_app(
+      project: 'ios/App/App.xcodeproj', # SPM project — no .xcworkspace
+      scheme: 'App',                    # Capacitor's default iOS scheme
+      export_method: 'app-store',
+      export_options: {
+        signingStyle: 'manual',
+        provisioningProfiles: {
+          APP_ID => PROFILE
+        }
+      }
+    )
+    upload_to_testflight(api_key: api_key, skip_waiting_for_build_processing: true)
+  end
+end

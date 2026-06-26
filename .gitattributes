@@ -1,0 +1,7 @@
+*.pbxproj -text
+*.plist text eol=lf
+*.xcscheme text eol=lf
+*.entitlements text eol=lf
+*.swift text eol=lf
+*.rb text eol=lf
+*.yml text eol=lf

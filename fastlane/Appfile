@@ -1,0 +1,2 @@
+app_identifier('top.fancytech.mytvbox')
+# API-key auth implies the team; no apple_id/username needed.

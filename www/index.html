@@ -1,0 +1,126 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>mytvbox</title>
+<style>
+  :root{ --bg:#070a0f; --panel:#0e141c; --line:rgba(255,255,255,.1); --ink:#dfe7ef; --dim:#8794a4; --blue:#3ea6ff; --green:#5ef0b0; --red:#ff8e8e; }
+  *{box-sizing:border-box}
+  body{margin:0;min-height:100vh;background:radial-gradient(120% 80% at 70% -10%,#10202e 0%,transparent 55%),var(--bg);
+    color:var(--ink);font:16px/1.6 -apple-system,"Segoe UI",Roboto,"PingFang SC",sans-serif;
+    display:flex;flex-direction:column;align-items:center;justify-content:center;padding:32px 22px;gap:18px;
+    padding-top:max(32px,env(safe-area-inset-top));-webkit-font-smoothing:antialiased}
+  .logo{width:54px;height:54px;border-radius:15px;display:grid;place-items:center;
+    background:linear-gradient(150deg,#123 0%,#0b1118 100%);border:1px solid var(--line)}
+  h1{margin:0;font-size:22px;font-weight:800}
+  p.sub{margin:0;color:var(--dim);font-size:14px;text-align:center;max-width:340px}
+  .card{width:100%;max-width:380px;background:var(--panel);border:1px solid var(--line);border-radius:16px;padding:20px;display:flex;flex-direction:column;gap:14px}
+  label{font-size:13px;color:var(--dim)}
+  input{width:100%;font-size:17px;padding:13px 14px;border-radius:11px;border:1px solid var(--line);
+    background:#0a0f15;color:var(--ink);outline:none}
+  input:focus{border-color:var(--blue)}
+  button{font-size:16px;font-weight:700;padding:13px;border-radius:11px;border:none;cursor:pointer;
+    background:linear-gradient(160deg,var(--blue),#1c79d6);color:#04121c}
+  button.ghost{background:transparent;border:1px solid var(--line);color:var(--dim);font-weight:600}
+  .msg{font-size:13.5px;text-align:center;min-height:18px}
+  .msg.err{color:var(--red)} .msg.ok{color:var(--green)}
+  .row{display:flex;gap:10px} .row button{flex:1}
+</style>
+</head>
+<body>
+  <div class="logo">
+    <svg width="26" height="26" viewBox="0 0 24 24" fill="none"><path d="M8 5l11 7-11 7V5z" fill="#3ea6ff"/></svg>
+  </div>
+  <h1>mytvbox</h1>
+  <p class="sub" id="sub">输入运行 mytvbox 服务的电脑地址（与本机在同一局域网）</p>
+
+  <div class="card" id="setup" style="display:none">
+    <div>
+      <label for="addr">电脑地址</label>
+      <input id="addr" inputmode="url" autocapitalize="off" autocorrect="off" spellcheck="false"
+             placeholder="192.168.1.10  或  192.168.1.10:8787" />
+    </div>
+    <button id="connect">连接</button>
+    <div class="msg" id="msg"></div>
+  </div>
+
+  <div class="card" id="connecting" style="display:none">
+    <div class="msg ok" id="cmsg">正在连接…</div>
+    <div class="row">
+      <button class="ghost" id="change">更改地址</button>
+    </div>
+  </div>
+
+<script>
+  const KEY = 'serverUrl';
+  const $ = (id) => document.getElementById(id);
+
+  // Capacitor Preferences (native, persists across the cross-origin navigation
+  // to the LAN server). Falls back to localStorage in a plain browser preview.
+  const prefs = {
+    async get(k){
+      const P = window.Capacitor?.Plugins?.Preferences;
+      if (P) return (await P.get({ key:k })).value;
+      return localStorage.getItem(k);
+    },
+    async set(k,v){
+      const P = window.Capacitor?.Plugins?.Preferences;
+      if (P) return P.set({ key:k, value:v });
+      localStorage.setItem(k,v);
+    },
+    async remove(k){
+      const P = window.Capacitor?.Plugins?.Preferences;
+      if (P) return P.remove({ key:k });
+      localStorage.removeItem(k);
+    }
+  };
+
+  // Normalize "192.168.1.10" / "host:8080" / "http://host:8787" -> "http://host:8787".
+  function normalize(raw){
+    let s = (raw||'').trim();
+    if (!s) return null;
+    if (!/^https?:\/\//i.test(s)) s = 'http://' + s;
+    let u;
+    try { u = new URL(s); } catch { return null; }
+    if (!u.port && u.protocol === 'http:') u.port = '8787';
+    return u.origin + '/';
+  }
+
+  function showSetup(prefill){
+    $('setup').style.display = 'flex';
+    $('connecting').style.display = 'none';
+    if (prefill) $('addr').value = prefill;
+    $('addr').focus();
+  }
+
+  function goConnect(url){
+    $('setup').style.display = 'none';
+    $('connecting').style.display = 'flex';
+    $('cmsg').textContent = '正在连接 ' + url + ' …';
+    // Navigate the top-level WebView to the LAN server. The Capacitor bridge
+    // stays injected, so the mytvbox UI there can call NativePlayer.
+    setTimeout(() => { window.location.replace(url); }, 600);
+  }
+
+  $('connect').addEventListener('click', async () => {
+    const url = normalize($('addr').value);
+    if (!url){ $('msg').className = 'msg err'; $('msg').textContent = '地址格式不对'; return; }
+    await prefs.set(KEY, url);
+    goConnect(url);
+  });
+  $('addr')?.addEventListener('keydown', (e) => { if (e.key === 'Enter') $('connect').click(); });
+  $('change').addEventListener('click', async () => {
+    const cur = await prefs.get(KEY);
+    await prefs.remove(KEY);
+    showSetup(cur);
+  });
+
+  (async () => {
+    const saved = await prefs.get(KEY);
+    if (saved) goConnect(saved);
+    else showSetup();
+  })();
+</script>
+</body>
+</html>

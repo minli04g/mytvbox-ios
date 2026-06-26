@@ -1,0 +1,18 @@
+{
+  "name": "mytvbox-ios",
+  "version": "0.1.0",
+  "private": true,
+  "description": "mytvbox iOS thin client (Capacitor) — WebView onto a LAN mytvbox server + native AVPlayer/AirPlay",
+  "scripts": {
+    "sync": "cap sync ios"
+  },
+  "dependencies": {
+    "@capacitor/core": "^8",
+    "@capacitor/ios": "^8",
+    "@capacitor/preferences": "^8"
+  },
+  "devDependencies": {
+    "@capacitor/cli": "^8",
+    "typescript": "^5"
+  }
+}
