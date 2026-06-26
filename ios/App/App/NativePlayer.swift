@@ -6,56 +6,72 @@ import Capacitor
 // Native video playback for the in-app mytvbox UI.
 //
 // The WebView's <video> only AirPlays audio for HLS; AVPlayer does full video
-// AirPlay to Apple TV. The page calls NativePlayer.play({url,title}) with the
+// AirPlay to Apple TV. The page calls NativePlayer.play({url,title,ep}) with the
 // proxied stream URL (referer/UA already baked in, so no extra headers).
 //
-// For one-tap binge: when an item finishes we emit an "ended" event; the page
-// resolves the next episode and calls play() again. If the player is already
-// presented we swap the item in place so the AirPlay session continues
-// uninterrupted instead of tearing down and re-presenting.
+// Auto-advance uses a real AVQueuePlayer: the page pre-resolves the next few
+// episodes and enqueue()s them, so AVFoundation advances item->item on its own.
+// That keeps the binge going even when the app is backgrounded / screen locked
+// (UIBackgroundModes=audio keeps us alive) — the JS "ended->resolve next" chain
+// could NOT, because WKWebView's JS is frozen in the background.
+//
+// We emit "advanced" {ep} whenever the current item changes so the page (when
+// foregrounded) can refill the lookahead window, and "ended" when the queue
+// drains.
 @objc(NativePlayerPlugin)
 public class NativePlayerPlugin: CAPPlugin, CAPBridgedPlugin {
     public let identifier = "NativePlayerPlugin"
     public let jsName = "NativePlayer"
     public let pluginMethods: [CAPPluginMethod] = [
         CAPPluginMethod(name: "play", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "enqueue", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "lockLandscape", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "unlockOrientation", returnType: CAPPluginReturnPromise)
     ]
 
-    private var player: AVPlayer?
+    private var player: AVQueuePlayer?
     private var playerVC: AVPlayerViewController?
-    private var endObserver: NSObjectProtocol?
+    private var itemObs: NSKeyValueObservation?
+    // Maps each queued AVPlayerItem to its episode index so we can report which
+    // episode is now playing when the queue advances.
+    private var itemEp: [ObjectIdentifier: Int] = [:]
 
+    // Start (or restart) the queue with a single episode. Subsequent episodes are
+    // appended via enqueue(). If a player is already on screen we swap the queue
+    // in place so the AirPlay session continues uninterrupted.
     @objc func play(_ call: CAPPluginCall) {
         guard let urlStr = call.getString("url"), let url = URL(string: urlStr) else {
             call.reject("missing or invalid 'url'")
             return
         }
         let title = call.getString("title") ?? ""
+        let ep = call.getInt("ep") ?? 0
 
         DispatchQueue.main.async {
-            // .playback keeps audio alive for AirPlay / lock-screen continuation.
+            // .playback keeps audio/playback alive for AirPlay + background binge.
             do {
                 try AVAudioSession.sharedInstance().setCategory(.playback, mode: .moviePlayback)
                 try AVAudioSession.sharedInstance().setActive(true)
             } catch { /* non-fatal */ }
 
             let item = self.makeItem(url: url, title: title)
-            self.observeEnd(of: item)
+            self.itemEp.removeAll()
+            self.itemEp[ObjectIdentifier(item)] = ep
 
-            // Already on screen → swap the item so AirPlay continues seamlessly.
+            // Already on screen → reset the queue to this item, keep the player.
             if let player = self.player, self.playerVC?.presentingViewController != nil {
-                player.replaceCurrentItem(with: item)
+                player.removeAllItems()
+                if player.canInsert(item, after: nil) { player.insert(item, after: nil) }
                 player.play()
                 call.resolve()
                 return
             }
 
-            let player = AVPlayer(playerItem: item)
+            let player = AVQueuePlayer(items: [item])
             player.allowsExternalPlayback = true                       // AirPlay
             player.usesExternalPlaybackWhileExternalScreenIsActive = true
             self.player = player
+            self.observeCurrentItem(of: player)
 
             let vc = AVPlayerViewController()
             vc.player = player
@@ -69,6 +85,24 @@ public class NativePlayerPlugin: CAPPlugin, CAPBridgedPlugin {
             }
             presenter.present(vc, animated: true) {
                 player.play()
+            }
+            call.resolve()
+        }
+    }
+
+    // Append one or more pre-resolved episodes to the tail of the queue.
+    // items: [{ url, title, ep }]
+    @objc func enqueue(_ call: CAPPluginCall) {
+        let items = call.getArray("items", JSObject.self) ?? []
+        DispatchQueue.main.async {
+            guard let player = self.player else { call.resolve(); return }
+            for raw in items {
+                guard let urlStr = raw["url"] as? String, let url = URL(string: urlStr) else { continue }
+                let title = raw["title"] as? String ?? ""
+                let ep = raw["ep"] as? Int ?? -1
+                let item = self.makeItem(url: url, title: title)
+                self.itemEp[ObjectIdentifier(item)] = ep
+                if player.canInsert(item, after: nil) { player.insert(item, after: nil) }
             }
             call.resolve()
         }
@@ -109,14 +143,18 @@ public class NativePlayerPlugin: CAPPlugin, CAPBridgedPlugin {
         return item
     }
 
-    // Fire "ended" to JS when the current item finishes so the page can queue
-    // the next episode. Re-bind per item; drop the previous observer first.
-    private func observeEnd(of item: AVPlayerItem) {
-        if let o = endObserver { NotificationCenter.default.removeObserver(o) }
-        endObserver = NotificationCenter.default.addObserver(
-            forName: .AVPlayerItemDidPlayToEndTime, object: item, queue: .main
-        ) { [weak self] _ in
-            self?.notifyListeners("ended", data: [:])
+    // Report queue position to JS: "advanced" {ep} when a new item starts (the
+    // queue auto-advanced, or play() began), "ended" when the queue drains. The
+    // page uses "advanced" to refill the lookahead window when foregrounded.
+    private func observeCurrentItem(of player: AVQueuePlayer) {
+        itemObs = player.observe(\.currentItem, options: [.new]) { [weak self] p, _ in
+            guard let self = self else { return }
+            if let item = p.currentItem {
+                let ep = self.itemEp[ObjectIdentifier(item)] ?? -1
+                self.notifyListeners("advanced", data: ["ep": ep])
+            } else {
+                self.notifyListeners("ended", data: [:])
+            }
         }
     }
 }
