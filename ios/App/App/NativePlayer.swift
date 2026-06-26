@@ -18,7 +18,9 @@ public class NativePlayerPlugin: CAPPlugin, CAPBridgedPlugin {
     public let identifier = "NativePlayerPlugin"
     public let jsName = "NativePlayer"
     public let pluginMethods: [CAPPluginMethod] = [
-        CAPPluginMethod(name: "play", returnType: CAPPluginReturnPromise)
+        CAPPluginMethod(name: "play", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "lockLandscape", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "unlockOrientation", returnType: CAPPluginReturnPromise)
     ]
 
     private var player: AVPlayer?
@@ -69,6 +71,29 @@ public class NativePlayerPlugin: CAPPlugin, CAPBridgedPlugin {
                 player.play()
             }
             call.resolve()
+        }
+    }
+
+    // Force the app into landscape (overrides the device rotation lock) for the
+    // player's fullscreen, and release it again.
+    @objc func lockLandscape(_ call: CAPPluginCall) {
+        DispatchQueue.main.async { self.setOrientation(.landscape); call.resolve() }
+    }
+
+    @objc func unlockOrientation(_ call: CAPPluginCall) {
+        DispatchQueue.main.async { self.setOrientation(.all); call.resolve() }
+    }
+
+    private func setOrientation(_ mask: UIInterfaceOrientationMask) {
+        (UIApplication.shared.delegate as? AppDelegate)?.orientationLock = mask
+        if #available(iOS 16.0, *) {
+            self.bridge?.viewController?.setNeedsUpdateOfSupportedInterfaceOrientations()
+            let scene = UIApplication.shared.connectedScenes.first as? UIWindowScene
+            scene?.requestGeometryUpdate(.iOS(interfaceOrientations: mask))
+        } else {
+            let o: UIInterfaceOrientation = mask == .landscape ? .landscapeRight : .portrait
+            UIDevice.current.setValue(o.rawValue, forKey: "orientation")
+            UIViewController.attemptRotationToDeviceOrientation()
         }
     }
 

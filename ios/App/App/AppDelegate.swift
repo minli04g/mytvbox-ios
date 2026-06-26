@@ -6,6 +6,15 @@ class AppDelegate: UIResponder, UIApplicationDelegate {
 
     var window: UIWindow?
 
+    // Forced orientation for the player's fullscreen. NativePlayer flips this to
+    // .landscape (and back) to override the device rotation lock; this delegate
+    // method supersedes Info.plist's allowed orientations.
+    var orientationLock: UIInterfaceOrientationMask = .all
+
+    func application(_ application: UIApplication, supportedInterfaceOrientationsFor window: UIWindow?) -> UIInterfaceOrientationMask {
+        return orientationLock
+    }
+
     func application(_ application: UIApplication, didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]?) -> Bool {
         // Override point for customization after application launch.
         return true
