@@ -12,7 +12,7 @@
 # only), so unlike the safebrowser template we do NOT set CODE_SIGN_ENTITLEMENTS.
 require 'xcodeproj'
 
-PLUGIN_SOURCES = ['NativePlayer.swift'].freeze
+PLUGIN_SOURCES = ['NativePlayer.swift', 'MainViewController.swift'].freeze
 
 project_path = File.expand_path('../ios/App/App.xcodeproj', __dir__)
 project = Xcodeproj::Project.open(project_path)
