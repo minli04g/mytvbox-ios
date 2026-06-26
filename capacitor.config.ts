@@ -2,7 +2,7 @@ import type { CapacitorConfig } from '@capacitor/cli'
 
 const config: CapacitorConfig = {
   appId: 'top.fancytech.mytvbox',
-  appName: 'mytvbox',
+  appName: '聚影',
   // www/ holds the first-run setup page + offline fallback. There is no fixed
   // server.url: the LAN server IP is dynamic, so the WebView starts on the
   // bundled setup page and then navigates to the user-entered LAN address
