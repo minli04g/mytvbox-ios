@@ -30,9 +30,24 @@ jobs:
 
       # macos-latest images sometimes ship Xcode 26 without the iOS 26 device
       # platform preinstalled -> archive fails with "iOS 26.0 is not installed".
-      # Fetch it (idempotent if already present).
+      # `xcodebuild -downloadPlatform iOS` fetches it, but intermittently dies
+      # with "Unable to connect to simulator" (exit 70) — a flaky simulator
+      # service call, unrelated to the device SDK archiving actually needs. So
+      # retry; and if it still fails but an iphoneos SDK is already present,
+      # proceed anyway (only a genuinely missing device SDK is fatal).
       - name: Ensure iOS platform installed
-        run: xcodebuild -downloadPlatform iOS
+        run: |
+          for i in 1 2 3 4 5; do
+            echo "downloadPlatform attempt $i"
+            if xcodebuild -downloadPlatform iOS; then echo "platform ready"; exit 0; fi
+            echo "attempt $i failed; retry in ${i}5s"; sleep "${i}5"
+          done
+          echo "downloadPlatform kept failing; checking for an installed iphoneos SDK..."
+          if xcodebuild -showsdks 2>/dev/null | grep -qi "iphoneos"; then
+            echo "::warning::downloadPlatform failed but an iphoneos SDK is present — proceeding."
+            exit 0
+          fi
+          echo "::error::no iphoneos SDK available after retries"; exit 1
 
       - uses: actions/setup-node@v4
         with:
