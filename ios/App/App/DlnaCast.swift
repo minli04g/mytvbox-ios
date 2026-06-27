@@ -26,6 +26,9 @@ public class DlnaCastPlugin: CAPPlugin, CAPBridgedPlugin {
         CAPPluginMethod(name: "cast", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "stop", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "state", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "seek", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "pause", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "resume", returnType: CAPPluginReturnPromise),
     ]
 
     // Mirror gui/dlna.js. 49152 first — that's where Xiaomi/HyperOS renderers sit,
@@ -164,16 +167,39 @@ public class DlnaCastPlugin: CAPPlugin, CAPBridgedPlugin {
         }
     }
 
-    // GetTransportInfo — lets the UI confirm the TV actually started playing.
+    // Transport state + current/total position — lets the UI act as a remote:
+    // confirm the TV started, drive the progress bar, and seek.
     @objc func state(_ call: CAPPluginCall) {
         guard let controlURL = call.getString("controlURL") else { call.reject("controlURL required"); return }
         workQueue.async {
-            let body = self.soap(controlURL, "GetTransportInfo", "<InstanceID>0</InstanceID>") ?? ""
+            let ti = self.soap(controlURL, "GetTransportInfo", "<InstanceID>0</InstanceID>") ?? ""
+            let pi = self.soap(controlURL, "GetPositionInfo", "<InstanceID>0</InstanceID>") ?? ""
             call.resolve([
-                "transportState": self.rx("<CurrentTransportState>([^<]*)</CurrentTransportState>", body) ?? "",
-                "transportStatus": self.rx("<CurrentTransportStatus>([^<]*)</CurrentTransportStatus>", body) ?? "",
+                "transportState": self.rx("<CurrentTransportState>([^<]*)</CurrentTransportState>", ti) ?? "",
+                "transportStatus": self.rx("<CurrentTransportStatus>([^<]*)</CurrentTransportStatus>", ti) ?? "",
+                "relSeconds": self.secs(self.rx("<RelTime>([^<]*)</RelTime>", pi) ?? ""),
+                "durSeconds": self.secs(self.rx("<TrackDuration>([^<]*)</TrackDuration>", pi) ?? ""),
             ])
         }
+    }
+
+    @objc func seek(_ call: CAPPluginCall) {
+        guard let controlURL = call.getString("controlURL") else { call.reject("controlURL required"); return }
+        let target = hms(call.getDouble("seconds") ?? 0)
+        workQueue.async {
+            _ = self.soap(controlURL, "Seek", "<InstanceID>0</InstanceID><Unit>REL_TIME</Unit><Target>\(target)</Target>")
+            call.resolve(["ok": true])
+        }
+    }
+
+    @objc func pause(_ call: CAPPluginCall) {
+        guard let controlURL = call.getString("controlURL") else { call.reject("controlURL required"); return }
+        workQueue.async { _ = self.soap(controlURL, "Pause", "<InstanceID>0</InstanceID>"); call.resolve(["ok": true]) }
+    }
+
+    @objc func resume(_ call: CAPPluginCall) {
+        guard let controlURL = call.getString("controlURL") else { call.reject("controlURL required"); return }
+        workQueue.async { _ = self.soap(controlURL, "Play", "<InstanceID>0</InstanceID><Speed>1</Speed>"); call.resolve(["ok": true]) }
     }
 
     // MARK: - SOAP / HTTP
@@ -229,6 +255,18 @@ public class DlnaCastPlugin: CAPPlugin, CAPBridgedPlugin {
     }
 
     // MARK: - Helpers
+
+    // seconds -> "H:MM:SS" (UPnP REL_TIME), and "H:MM:SS" -> seconds.
+    private func hms(_ s: Double) -> String {
+        let t = max(0, Int(s.rounded()))
+        return String(format: "%d:%02d:%02d", t / 3600, (t % 3600) / 60, t % 60)
+    }
+    private func secs(_ t: String) -> Int {
+        let p = t.split(separator: ":").compactMap { Int($0) }
+        if p.count == 3 { return p[0] * 3600 + p[1] * 60 + p[2] }
+        if p.count == 2 { return p[0] * 60 + p[1] }
+        return 0
+    }
 
     private func esc(_ s: String) -> String {
         return s.replacingOccurrences(of: "&", with: "&amp;")
