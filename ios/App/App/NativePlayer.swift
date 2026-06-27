@@ -1,4 +1,5 @@
 import Foundation
+import UIKit
 import AVKit
 import AVFoundation
 import Capacitor
@@ -14,11 +15,12 @@ import Capacitor
 // presented we swap the item in place so the AirPlay session continues
 // uninterrupted instead of tearing down and re-presenting.
 @objc(NativePlayerPlugin)
-public class NativePlayerPlugin: CAPPlugin, CAPBridgedPlugin {
+public class NativePlayerPlugin: CAPPlugin, CAPBridgedPlugin, AVRoutePickerViewDelegate {
     public let identifier = "NativePlayerPlugin"
     public let jsName = "NativePlayer"
     public let pluginMethods: [CAPPluginMethod] = [
         CAPPluginMethod(name: "play", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "airplayPick", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "lockLandscape", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "unlockOrientation", returnType: CAPPluginReturnPromise)
     ]
@@ -28,6 +30,8 @@ public class NativePlayerPlugin: CAPPlugin, CAPBridgedPlugin {
     private var endObserver: NSObjectProtocol?
     private var interruptObserver: NSObjectProtocol?
     private var wasPlayingBeforeInterruption = false
+    private var pendingPlay: (url: URL, title: String)?
+    private var routePickerView: AVRoutePickerView?
 
     @objc func play(_ call: CAPPluginCall) {
         guard let urlStr = call.getString("url"), let url = URL(string: urlStr) else {
@@ -35,58 +39,94 @@ public class NativePlayerPlugin: CAPPlugin, CAPBridgedPlugin {
             return
         }
         let title = call.getString("title") ?? ""
+        DispatchQueue.main.async { self.presentPlayer(url: url, title: title) }
+        call.resolve()
+    }
 
+    // One-tap AirPlay: pop the system route picker FIRST (device list), then start
+    // playback once the user picks a device — so it's already routed to the chosen
+    // TV. Without this, tapping the in-app AirPlay button just opens a local player
+    // and the user must tap ITS AirPlay button and pick a device (two steps).
+    @objc func airplayPick(_ call: CAPPluginCall) {
+        guard let urlStr = call.getString("url"), let url = URL(string: urlStr) else {
+            call.reject("missing or invalid 'url'")
+            return
+        }
+        let title = call.getString("title") ?? ""
         DispatchQueue.main.async {
-            // .playback keeps audio alive for AirPlay / lock-screen continuation.
-            // .longFormVideo route-sharing policy is the key for AirPlay-to-TV:
-            // it tells iOS this is long-form VIDEO, so the system prefers a
-            // video-capable AirPlay route AND gives the playback its own route —
-            // a Xiaomi/smart-TV no longer grabs audio-only (黑屏只投声音), and
-            // incidental audio (an incoming call, system sounds) won't leak onto
-            // the TV route. Without it, .playback defaults to .default and routes
-            // decoded audio to any AirPlay device, video left on the phone.
-            do {
-                try AVAudioSession.sharedInstance().setCategory(
-                    .playback, mode: .moviePlayback, policy: .longFormVideo)
-                try AVAudioSession.sharedInstance().setActive(true)
-            } catch { /* non-fatal */ }
-            self.observeInterruptions()
-
-            let item = self.makeItem(url: url, title: title)
-            self.observeEnd(of: item)
-
-            // Already on screen → swap the item so AirPlay continues seamlessly.
-            if let player = self.player, self.playerVC?.presentingViewController != nil {
-                player.replaceCurrentItem(with: item)
-                player.play()
-                call.resolve()
-                return
+            guard let host = self.bridge?.viewController?.view else {
+                self.presentPlayer(url: url, title: title); call.resolve(); return
             }
-
-            let player = AVPlayer(playerItem: item)
-            player.allowsExternalPlayback = true                       // AirPlay
-            player.usesExternalPlaybackWhileExternalScreenIsActive = true
-            self.player = player
-
-            // Subclass so closing the player (done button / swipe) tears the
-            // audio session down — otherwise the AirPlay route lingers and a
-            // later call keeps routing to the TV.
-            let vc = PlayerViewController()
-            vc.onDismiss = { [weak self] in self?.teardown() }
-            vc.player = player
-            vc.allowsPictureInPicturePlayback = true
-            vc.modalPresentationStyle = .fullScreen
-            self.playerVC = vc
-
-            guard let presenter = self.bridge?.viewController else {
-                call.reject("no view controller to present from")
-                return
+            self.pendingPlay = (url, title)
+            let picker = AVRoutePickerView(frame: CGRect(x: -100, y: -100, width: 44, height: 44))
+            picker.prioritizesVideoDevices = true
+            picker.delegate = self
+            host.addSubview(picker)
+            self.routePickerView = picker
+            // Programmatically present the route sheet (tap the picker's inner button).
+            var popped = false
+            for sub in picker.subviews {
+                if let b = sub as? UIButton { b.sendActions(for: .touchUpInside); popped = true; break }
             }
-            presenter.present(vc, animated: true) {
-                player.play()
+            if !popped {  // subview layout changed across iOS versions → just present
+                picker.removeFromSuperview(); self.routePickerView = nil; self.pendingPlay = nil
+                self.presentPlayer(url: url, title: title)
             }
             call.resolve()
         }
+    }
+
+    public func routePickerViewDidEndPresentingRoutes(_ routePickerView: AVRoutePickerView) {
+        routePickerView.removeFromSuperview()
+        self.routePickerView = nil
+        guard let p = pendingPlay else { return }
+        pendingPlay = nil
+        // Let the chosen route activate before playback starts.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
+            self.presentPlayer(url: p.url, title: p.title)
+        }
+    }
+
+    // Set up the audio session and present the AVPlayer (shared by play + airplayPick).
+    private func presentPlayer(url: URL, title: String) {
+        // .playback keeps audio alive for AirPlay / lock-screen continuation.
+        // .longFormVideo route-sharing policy is the key for AirPlay-to-TV: it tells
+        // iOS this is long-form VIDEO, so the system prefers a video-capable AirPlay
+        // route AND gives the playback its own route — a Xiaomi/smart-TV no longer
+        // grabs audio-only, and incidental audio (a call) won't leak onto the route.
+        do {
+            try AVAudioSession.sharedInstance().setCategory(
+                .playback, mode: .moviePlayback, policy: .longFormVideo)
+            try AVAudioSession.sharedInstance().setActive(true)
+        } catch { /* non-fatal */ }
+        observeInterruptions()
+
+        let item = makeItem(url: url, title: title)
+        observeEnd(of: item)
+
+        // Already on screen → swap the item so AirPlay continues seamlessly.
+        if let player = self.player, self.playerVC?.presentingViewController != nil {
+            player.replaceCurrentItem(with: item)
+            player.play()
+            return
+        }
+
+        let player = AVPlayer(playerItem: item)
+        player.allowsExternalPlayback = true                       // AirPlay
+        player.usesExternalPlaybackWhileExternalScreenIsActive = true
+        self.player = player
+
+        // Subclass so closing the player tears the audio session down — otherwise
+        // the AirPlay route lingers and a later call keeps routing to the TV.
+        let vc = PlayerViewController()
+        vc.onDismiss = { [weak self] in self?.teardown() }
+        vc.player = player
+        vc.allowsPictureInPicturePlayback = true
+        vc.modalPresentationStyle = .fullScreen
+        self.playerVC = vc
+
+        guard let presenter = self.bridge?.viewController else { return }
+        presenter.present(vc, animated: true) { player.play() }
     }
 
     // An incoming call (or any audio interruption) must pause playback — which,
