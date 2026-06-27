@@ -9,6 +9,7 @@ import Capacitor
 class MainViewController: CAPBridgeViewController {
     override func capacitorDidLoad() {
         bridge?.registerPluginInstance(NativePlayerPlugin())
+        bridge?.registerPluginInstance(DlnaCastPlugin())
     }
 
     // Keep the WebView out of AirPlay entirely. Capacitor's WKWebView defaults to
