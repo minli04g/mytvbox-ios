@@ -33,6 +33,7 @@
 		7B61D2002D2A000100A10001 /* NativePlayer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NativePlayer.swift; sourceTree = "<group>"; };
 		7B61D2022D2A000100A10001 /* MainViewController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MainViewController.swift; sourceTree = "<group>"; };
 		7B61D2042D2A000100A10001 /* DlnaCast.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DlnaCast.swift; sourceTree = "<group>"; };
+		7B61D2062D2A000100A10001 /* App.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = App.entitlements; sourceTree = "<group>"; };
 		958DCC722DB07C7200EA8C5F /* debug.xcconfig */ = {isa = PBXFileReference; lastKnownFileType = text.xcconfig; name = debug.xcconfig; path = ../debug.xcconfig; sourceTree = SOURCE_ROOT; };
 /* End PBXFileReference section */
 
@@ -73,6 +74,7 @@
 				7B61D2002D2A000100A10001 /* NativePlayer.swift */,
 				7B61D2022D2A000100A10001 /* MainViewController.swift */,
 				7B61D2042D2A000100A10001 /* DlnaCast.swift */,
+				7B61D2062D2A000100A10001 /* App.entitlements */,
 				504EC30B1FED79650016851F /* Main.storyboard */,
 				504EC30E1FED79650016851F /* Assets.xcassets */,
 				504EC3101FED79650016851F /* LaunchScreen.storyboard */,
@@ -307,6 +309,7 @@
 			baseConfigurationReference = 958DCC722DB07C7200EA8C5F /* debug.xcconfig */;
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_ENTITLEMENTS = App/App.entitlements;
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
 				INFOPLIST_FILE = App/Info.plist;
@@ -329,6 +332,7 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_ENTITLEMENTS = App/App.entitlements;
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
 				INFOPLIST_FILE = App/Info.plist;

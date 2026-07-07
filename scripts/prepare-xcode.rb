@@ -8,11 +8,11 @@
 #     pbxproj. cap add/sync never touch it, hence this step.
 #  2. CURRENT_PROJECT_VERSION = $BUILD_NUMBER (unique TestFlight build #).
 #
-# mytvbox needs no entitlements file (AirPlay + Local Network are Info.plist
-# only), so unlike the safebrowser template we do NOT set CODE_SIGN_ENTITLEMENTS.
 require 'xcodeproj'
 
 PLUGIN_SOURCES = ['NativePlayer.swift', 'MainViewController.swift', 'DlnaCast.swift'].freeze
+ENTITLEMENTS_FILE = 'App.entitlements'
+ENTITLEMENTS_BUILD_SETTING = 'App/App.entitlements'
 
 project_path = File.expand_path('../ios/App/App.xcodeproj', __dir__)
 project = Xcodeproj::Project.open(project_path)
@@ -35,8 +35,11 @@ PLUGIN_SOURCES.each do |fname|
   puts "registered #{fname} into App target"
 end
 
+group.files.find { |f| f.display_name == ENTITLEMENTS_FILE } || group.new_file(ENTITLEMENTS_FILE)
+
 build_number = ENV['BUILD_NUMBER']
 target.build_configurations.each do |config|
+  config.build_settings['CODE_SIGN_ENTITLEMENTS'] = ENTITLEMENTS_BUILD_SETTING
   config.build_settings['CURRENT_PROJECT_VERSION'] = build_number if build_number && !build_number.empty?
 end
 

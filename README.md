@@ -17,18 +17,19 @@
 
 ## DLNA 发现策略
 
-`ios/App/App/DlnaCast.swift` 与 Android/Harmony 客户端保持同一组 JS 可调用方法。iOS 端不走 SSDP multicast，因为 iOS 14+ 的 multicast 需要 Apple 单独授权；当前实现使用本地网络权限即可工作的 TCP 端口扫描：
+`ios/App/App/DlnaCast.swift` 与 Android/Harmony 客户端保持同一组 JS 可调用方法。iOS 端已启用 Apple 的 Multicast Networking entitlement，发现设备时先走 SSDP M-SEARCH，再回退到 TCP 端口扫描：
 
 - 支持手动 `location` 或 `host`/`port` 优先探测。
+- SSDP 搜索 `MediaRenderer`、`AVTransport` 和 `ssdp:all`，读取响应里的 `LOCATION`。
 - 自动读取手机 LAN IPv4 的 `/24` 网段。
-- 优先扫描常见主端口：`49152, 49153, 49154, 8200, 7676, 9197`。
+- 优先扫描常见主端口：`49152, 39620, 49153, 49154, 8200, 7676, 9197`。
 - 默认继续扫描次端口：`2869, 1400, 5000, 8060, 1901`；调用时可传 `fullScan: false` 只扫主端口。
 
 ## 关键事实
 
 - Capacitor 8 使用 SPM；需要 Xcode 26 / Node 22。
 - 自定义 Swift 源文件必须在 Xcode target 的 Sources 中，包括 `NativePlayer.swift`、`MainViewController.swift`、`DlnaCast.swift`。
-- 权限：`Info.plist` 包含 ATS 明文豁免（LAN HTTP）、本地网络说明、后台音频。
+- 权限：`Info.plist` 包含 ATS 明文豁免（LAN HTTP）、本地网络说明、后台音频；`App.entitlements` 包含 `com.apple.developer.networking.multicast`。
 - Bundle id：`top.fancytech.mytvbox`。
 
 ## 发布（GitHub Actions 到 TestFlight）

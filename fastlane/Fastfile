@@ -38,7 +38,7 @@ platform :ios do
   desc 'Initialize signing in the match repo (run once, after create_app)'
   lane :init_signing do
     setup_ci
-    match(type: 'appstore', app_identifier: APP_ID, api_key: asc_key, readonly: false)
+    match(type: 'appstore', app_identifier: APP_ID, api_key: asc_key, readonly: false, force: true)
   end
 
   desc 'Build and upload to TestFlight'

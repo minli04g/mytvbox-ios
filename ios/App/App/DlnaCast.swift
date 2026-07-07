@@ -1,14 +1,14 @@
 import Foundation
 import Capacitor
 import Network
+import Darwin
 
 // DLNA / UPnP AVTransport casting, driven from the phone. The mytvbox server
 // only resolves the media URL; the TV pulls the final stream directly.
 //
-// Discovery uses manual targets first, then scans the phone's LAN /24 ranges for
-// common UPnP description ports. SSDP multicast is intentionally not used here:
-// iOS 14+ requires Apple's multicast networking entitlement for that path, while
-// the TCP scan only needs the Local Network permission in Info.plist.
+// Discovery uses manual targets first, SSDP multicast second, then a TCP scan of
+// the phone's LAN /24 ranges for common UPnP description ports. SSDP requires
+// Apple's com.apple.developer.networking.multicast entitlement on iOS hardware.
 @objc(DlnaCastPlugin)
 public class DlnaCastPlugin: CAPPlugin, CAPBridgedPlugin {
     public let identifier = "DlnaCastPlugin"
@@ -24,7 +24,7 @@ public class DlnaCastPlugin: CAPPlugin, CAPBridgedPlugin {
     ]
 
     // 49152 first: Xiaomi/HyperOS renderers commonly listen there.
-    private let primaryUPnPPorts: [UInt16] = [49152, 49153, 49154, 8200, 7676, 9197]
+    private let primaryUPnPPorts: [UInt16] = [49152, 39620, 49153, 49154, 8200, 7676, 9197]
     private let secondaryUPnPPorts: [UInt16] = [2869, 1400, 5000, 8060, 1901]
     private var allUPnPPorts: [UInt16] { primaryUPnPPorts + secondaryUPnPPorts }
 
@@ -67,6 +67,14 @@ public class DlnaCastPlugin: CAPPlugin, CAPBridgedPlugin {
                 return
             }
 
+            for dev in self.discoverSsdp(timeoutMs: min(max(timeoutMs, 1500), 4500)) {
+                self.addDevice(dev, to: &devices, seen: &seen)
+            }
+            if !devices.isEmpty {
+                call.resolve(["devices": devices])
+                return
+            }
+
             let bases = self.lanBases24()
             guard !bases.isEmpty else {
                 call.resolve(["devices": []])
@@ -99,6 +107,102 @@ public class DlnaCastPlugin: CAPPlugin, CAPBridgedPlugin {
             }
 
             call.resolve(["devices": devices])
+        }
+    }
+
+    private func discoverSsdp(timeoutMs: Int) -> [[String: String]] {
+        let socketFd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
+        guard socketFd >= 0 else { return [] }
+        defer { close(socketFd) }
+
+        var reuse: Int32 = 1
+        setsockopt(socketFd, SOL_SOCKET, SO_REUSEADDR, &reuse, socklen_t(MemoryLayout<Int32>.size))
+
+        var bindAddress = sockaddr_in()
+        bindAddress.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+        bindAddress.sin_family = sa_family_t(AF_INET)
+        bindAddress.sin_port = in_port_t(0)
+        bindAddress.sin_addr = in_addr(s_addr: INADDR_ANY)
+        let bindResult = withUnsafePointer(to: &bindAddress) { pointer in
+            pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockaddrPointer in
+                Darwin.bind(socketFd, sockaddrPointer, socklen_t(MemoryLayout<sockaddr_in>.size))
+            }
+        }
+        guard bindResult == 0 else { return [] }
+
+        let mx = max(1, min(3, Int(ceil(Double(timeoutMs) / 2500.0))))
+        let searchTargets = [
+            "urn:schemas-upnp-org:device:MediaRenderer:1",
+            "urn:schemas-upnp-org:service:AVTransport:1",
+            "ssdp:all",
+        ]
+
+        for target in searchTargets {
+            let payload = "M-SEARCH * HTTP/1.1\r\n"
+                + "HOST: 239.255.255.250:1900\r\n"
+                + "MAN: \"ssdp:discover\"\r\n"
+                + "MX: \(mx)\r\n"
+                + "ST: \(target)\r\n\r\n"
+            sendSsdp(payload, socketFd: socketFd)
+        }
+
+        let deadline = Date().addingTimeInterval(Double(timeoutMs) / 1000.0)
+        var locations: [String] = []
+        var locationSet = Set<String>()
+        var buffer = [UInt8](repeating: 0, count: 8192)
+
+        while Date() < deadline {
+            let remainingMs = max(1, Int32(deadline.timeIntervalSinceNow * 1000.0))
+            var pollItem = pollfd(fd: socketFd, events: Int16(POLLIN), revents: 0)
+            let pollResult = poll(&pollItem, nfds_t(1), remainingMs)
+            if pollResult <= 0 { break }
+            if (pollItem.revents & Int16(POLLIN)) == 0 { continue }
+
+            var remote = sockaddr_storage()
+            var remoteLen = socklen_t(MemoryLayout<sockaddr_storage>.size)
+            let received = buffer.withUnsafeMutableBytes { rawBuffer in
+                withUnsafeMutablePointer(to: &remote) { remotePointer in
+                    remotePointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockaddrPointer in
+                        recvfrom(socketFd, rawBuffer.baseAddress, rawBuffer.count, 0, sockaddrPointer, &remoteLen)
+                    }
+                }
+            }
+            if received <= 0 { continue }
+
+            let data = Data(buffer.prefix(received))
+            guard let text = String(data: data, encoding: .utf8) ?? String(data: data, encoding: .ascii),
+                  let location = header("LOCATION", in: text),
+                  !locationSet.contains(location) else {
+                continue
+            }
+            locationSet.insert(location)
+            locations.append(location)
+        }
+
+        var devices: [[String: String]] = []
+        var seen = Set<String>()
+        for location in locations {
+            if let dev = describe(location) {
+                addDevice(dev, to: &devices, seen: &seen)
+            }
+        }
+        return devices
+    }
+
+    private func sendSsdp(_ payload: String, socketFd: Int32) {
+        guard let data = payload.data(using: .utf8) else { return }
+        var address = sockaddr_in()
+        address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+        address.sin_family = sa_family_t(AF_INET)
+        address.sin_port = in_port_t(1900).bigEndian
+        inet_pton(AF_INET, "239.255.255.250", &address.sin_addr)
+
+        data.withUnsafeBytes { rawBuffer in
+            withUnsafePointer(to: &address) { pointer in
+                pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockaddrPointer in
+                    _ = sendto(socketFd, rawBuffer.baseAddress, rawBuffer.count, 0, sockaddrPointer, socklen_t(MemoryLayout<sockaddr_in>.size))
+                }
+            }
         }
     }
 
@@ -449,6 +553,18 @@ public class DlnaCastPlugin: CAPPlugin, CAPBridgedPlugin {
             return nil
         }
         return String(s[groupRange])
+    }
+
+    private func header(_ name: String, in message: String) -> String? {
+        let lowerName = name.lowercased()
+        for line in message.components(separatedBy: .newlines) {
+            guard let colon = line.firstIndex(of: ":") else { continue }
+            let key = line[..<colon].trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            if key == lowerName {
+                return line[line.index(after: colon)...].trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+        }
+        return nil
     }
 
     private func lanBases24() -> [String] {
