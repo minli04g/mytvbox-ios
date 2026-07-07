@@ -2,12 +2,12 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-    <key>CAPACITOR_DEBUG</key>
+	<key>CAPACITOR_DEBUG</key>
 	<string>$(CAPACITOR_DEBUG)</string>
 	<key>CFBundleDevelopmentRegion</key>
 	<string>en</string>
 	<key>CFBundleDisplayName</key>
-        <string>聚影</string>
+	<string>聚影</string>
 	<key>CFBundleExecutable</key>
 	<string>$(EXECUTABLE_NAME)</string>
 	<key>CFBundleIdentifier</key>
@@ -51,7 +51,7 @@
 	<string>用于在局域网内连接你电脑上的 mytvbox 服务，并发现/投屏到电视。</string>
 	<key>NSAppTransportSecurity</key>
 	<dict>
-		<!-- mytvbox 服务跑在局域网的明文 HTTP 上(http://<电脑IP>:8787)，需允许 LAN 明文加载。 -->
+		<!-- mytvbox 服务运行在局域网明文 HTTP 上，需要允许 LAN 明文加载。 -->
 		<key>NSAllowsArbitraryLoads</key>
 		<true/>
 	</dict>

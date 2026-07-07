@@ -2,21 +2,13 @@ import Foundation
 import Capacitor
 import Network
 
-// DLNA / UPnP AVTransport casting, driven from the phone (cross-LAN use: the
-// phone is on the TV's LAN, the mytvbox server may be remote). This is a faithful
-// Swift port of the proven gui/dlna.js: discover MediaRenderers, then SetAVTransportURI
-// + Play over SOAP.
+// DLNA / UPnP AVTransport casting, driven from the phone. The mytvbox server
+// only resolves the media URL; the TV pulls the final stream directly.
 //
-// Discovery is by PORT SCAN of the phone's /24 (TCP connect to the usual UPnP
-// description ports, then fetch the description and pull the AVTransport controlURL).
-// We deliberately do NOT use SSDP here: SSDP needs UDP multicast, which iOS 14+
-// gates behind the com.apple.developer.networking.multicast entitlement (pending
-// Apple approval). Port scan needs only the Local Network permission
-// (NSLocalNetworkUsageDescription) and works today. When the multicast entitlement
-// lands, SSDP can be added as the fast path with this as the fallback.
-//
-// The cast URL handed to the TV is a DIRECT CDN URL (resolved server-side); the TV
-// pulls the stream itself, so the mytvbox server is never in the data path.
+// Discovery uses manual targets first, then scans the phone's LAN /24 ranges for
+// common UPnP description ports. SSDP multicast is intentionally not used here:
+// iOS 14+ requires Apple's multicast networking entitlement for that path, while
+// the TCP scan only needs the Local Network permission in Info.plist.
 @objc(DlnaCastPlugin)
 public class DlnaCastPlugin: CAPPlugin, CAPBridgedPlugin {
     public let identifier = "DlnaCastPlugin"
@@ -31,10 +23,12 @@ public class DlnaCastPlugin: CAPPlugin, CAPBridgedPlugin {
         CAPPluginMethod(name: "resume", returnType: CAPPluginReturnPromise),
     ]
 
-    // Mirror gui/dlna.js. 49152 first — that's where Xiaomi/HyperOS renderers sit,
-    // so the prioritized scan finds them within the first sweep.
-    private let UPNP_PORTS: [UInt16] = [49152, 49153, 49154, 8200, 7676, 9197, 2869, 1400, 5000, 8060, 1901]
-    private let DESC_PATHS = [
+    // 49152 first: Xiaomi/HyperOS renderers commonly listen there.
+    private let primaryUPnPPorts: [UInt16] = [49152, 49153, 49154, 8200, 7676, 9197]
+    private let secondaryUPnPPorts: [UInt16] = [2869, 1400, 5000, 8060, 1901]
+    private var allUPnPPorts: [UInt16] { primaryUPnPPorts + secondaryUPnPPorts }
+
+    private let descriptionPaths = [
         "/description.xml", "/dmr.xml", "/MediaRenderer/desc.xml", "/xml/device.xml",
         "/dlna/desc.xml", "/device.xml", "/upnp/dev/description.xml", "/rootDesc.xml",
         "/DeviceDescription.xml", "/ssdp/device-desc.xml", "/",
@@ -46,145 +40,295 @@ public class DlnaCastPlugin: CAPPlugin, CAPBridgedPlugin {
     // MARK: - Discovery
 
     @objc func discover(_ call: CAPPluginCall) {
-        let timeoutMs = call.getInt("timeoutMs") ?? 12000
+        let timeoutMs = call.getInt("timeoutMs") ?? 8000
+        let includeSecondaryPorts = call.getBool("fullScan") ?? true
+
         workQueue.async {
-            guard let base = self.lanBase24() else { call.resolve(["devices": []]); return }
-            // (ip,port) tasks, port-priority order (all hosts on 49152 first, etc.)
-            var tasks: [(String, UInt16)] = []
-            for port in self.UPNP_PORTS {
-                for host in 1...254 { tasks.append(("\(base).\(host)", port)) }
-            }
-            let open = self.scanOpen(tasks, deadlineMs: timeoutMs)
             var seen = Set<String>()
             var devices: [[String: String]] = []
-            for (ip, port) in open {
-                for path in self.DESC_PATHS {
-                    if let dev = self.describe("http://\(ip):\(port)\(path)") {
-                        let udn = dev["udn"] ?? dev["controlURL"] ?? "\(ip):\(port)"
-                        if !seen.contains(udn) { seen.insert(udn); devices.append(dev) }
-                        break
-                    }
+
+            for location in self.manualLocations(call) {
+                if let dev = self.describe(location) {
+                    self.addDevice(dev, to: &devices, seen: &seen)
                 }
             }
+            if !devices.isEmpty {
+                call.resolve(["devices": devices])
+                return
+            }
+
+            for hostPort in self.manualHostPorts(call) {
+                if let dev = self.describeHostPort(hostPort) {
+                    self.addDevice(dev, to: &devices, seen: &seen)
+                }
+            }
+            if !devices.isEmpty {
+                call.resolve(["devices": devices])
+                return
+            }
+
+            let bases = self.lanBases24()
+            guard !bases.isEmpty else {
+                call.resolve(["devices": []])
+                return
+            }
+
+            for base in bases {
+                let open = self.scanOpen(base: base, ports: self.primaryUPnPPorts, deadlineMs: timeoutMs)
+                for hostPort in open {
+                    if let dev = self.describeHostPort(hostPort) {
+                        self.addDevice(dev, to: &devices, seen: &seen)
+                    }
+                }
+                if !devices.isEmpty {
+                    call.resolve(["devices": devices])
+                    return
+                }
+            }
+
+            if includeSecondaryPorts {
+                for base in bases {
+                    let open = self.scanOpen(base: base, ports: self.secondaryUPnPPorts, deadlineMs: timeoutMs)
+                    for hostPort in open {
+                        if let dev = self.describeHostPort(hostPort) {
+                            self.addDevice(dev, to: &devices, seen: &seen)
+                        }
+                    }
+                    if !devices.isEmpty { break }
+                }
+            }
+
             call.resolve(["devices": devices])
         }
     }
 
-    // Probe (ip,port) pairs for an open TCP port, bounded concurrency + overall deadline.
+    private func scanOpen(base: String, ports: [UInt16], deadlineMs: Int) -> [(String, UInt16)] {
+        var tasks: [(String, UInt16)] = []
+        for port in ports {
+            for host in 1...254 {
+                tasks.append(("\(base).\(host)", port))
+            }
+        }
+        return scanOpen(tasks, deadlineMs: deadlineMs)
+    }
+
     private func scanOpen(_ tasks: [(String, UInt16)], deadlineMs: Int) -> [(String, UInt16)] {
         let sem = DispatchSemaphore(value: 60)
         let group = DispatchGroup()
         let lock = NSLock()
         var open: [(String, UInt16)] = []
         let deadline = Date().addingTimeInterval(Double(deadlineMs) / 1000.0)
+
         for (host, port) in tasks {
             if Date() > deadline { break }
             sem.wait()
             group.enter()
             probeOpen(host, port, timeout: 0.6) { ok in
-                if ok { lock.lock(); open.append((host, port)); lock.unlock() }
-                sem.signal(); group.leave()
+                if ok {
+                    lock.lock()
+                    open.append((host, port))
+                    lock.unlock()
+                }
+                sem.signal()
+                group.leave()
             }
         }
+
         _ = group.wait(timeout: .now() + Double(deadlineMs) / 1000.0 + 2)
         return open
     }
 
     private func probeOpen(_ host: String, _ port: UInt16, timeout: TimeInterval, completion: @escaping (Bool) -> Void) {
-        guard let nwPort = NWEndpoint.Port(rawValue: port) else { completion(false); return }
+        guard let nwPort = NWEndpoint.Port(rawValue: port) else {
+            completion(false)
+            return
+        }
+
         let conn = NWConnection(host: NWEndpoint.Host(host), port: nwPort, using: .tcp)
+        let lock = NSLock()
         var done = false
+
         let finish: (Bool) -> Void = { ok in
-            if done { return }; done = true
+            lock.lock()
+            if done {
+                lock.unlock()
+                return
+            }
+            done = true
+            lock.unlock()
+
             conn.cancel()
             completion(ok)
         }
-        conn.stateUpdateHandler = { st in
-            switch st {
-            case .ready: finish(true)
-            case .failed, .cancelled: finish(false)
-            default: break
+
+        conn.stateUpdateHandler = { state in
+            switch state {
+            case .ready:
+                finish(true)
+            case .failed, .cancelled:
+                finish(false)
+            default:
+                break
             }
         }
         conn.start(queue: scanQueue)
         scanQueue.asyncAfter(deadline: .now() + timeout) { finish(false) }
     }
 
+    private func describeHostPort(_ hostPort: (String, UInt16)) -> [String: String]? {
+        let (ip, port) = hostPort
+        for path in descriptionPaths {
+            if let dev = describe("http://\(ip):\(port)\(path)") {
+                return dev
+            }
+        }
+        return nil
+    }
+
     // Fetch + parse a device description; return a device dict if it has AVTransport.
-    private func describe(_ loc: String) -> [String: String]? {
-        guard let (status, body) = httpGet(loc), status == 200, !body.isEmpty else { return nil }
-        guard let re = try? NSRegularExpression(pattern: "<service>(.*?)</service>",
-                                                options: [.caseInsensitive, .dotMatchesLineSeparators]) else { return nil }
+    private func describe(_ location: String) -> [String: String]? {
+        guard let (status, body) = httpGet(location), status == 200, !body.isEmpty else {
+            return nil
+        }
+        guard let serviceRegex = try? NSRegularExpression(
+            pattern: "<service>(.*?)</service>",
+            options: [.caseInsensitive, .dotMatchesLineSeparators]
+        ) else {
+            return nil
+        }
+
         let full = NSRange(body.startIndex..., in: body)
-        var ctrl: String? = nil
-        for m in re.matches(in: body, range: full) {
-            guard let gr = Range(m.range(at: 1), in: body) else { continue }
-            let svc = String(body[gr])
-            if svc.range(of: "AVTransport", options: .caseInsensitive) != nil {
-                ctrl = rx("<controlURL>([^<]*)</controlURL>", svc)
+        var controlURL: String?
+        for match in serviceRegex.matches(in: body, range: full) {
+            guard let group = Range(match.range(at: 1), in: body) else { continue }
+            let service = String(body[group])
+            if service.range(of: "AVTransport", options: .caseInsensitive) != nil {
+                controlURL = rx("<controlURL>([^<]*)</controlURL>", service)
                 break
             }
         }
-        guard var control = ctrl?.trimmingCharacters(in: .whitespacesAndNewlines), !control.isEmpty else { return nil }
+
+        guard var control = controlURL?.trimmingCharacters(in: .whitespacesAndNewlines), !control.isEmpty else {
+            return nil
+        }
+
         let urlBase = rx("<URLBase>([^<]*)</URLBase>", body)?.trimmingCharacters(in: .whitespacesAndNewlines)
-        let baseStr = (urlBase?.isEmpty == false) ? urlBase! : loc
-        if let abs = URL(string: control, relativeTo: URL(string: baseStr))?.absoluteString { control = abs }
-        let name = rx("<friendlyName>([^<]*)</friendlyName>", body)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "DLNA 设备"
-        let udn = rx("<UDN>([^<]*)</UDN>", body)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? loc
-        return ["name": name, "controlURL": control, "udn": udn, "location": loc]
+        let base = (urlBase?.isEmpty == false) ? urlBase! : location
+        guard let absoluteControl = URL(string: control, relativeTo: URL(string: base))?.absoluteString else {
+            return nil
+        }
+        control = absoluteControl
+
+        let name = rx("<friendlyName>([^<]*)</friendlyName>", body)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? "DLNA 设备"
+        let udn = rx("<UDN>([^<]*)</UDN>", body)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? location
+
+        return ["name": name, "controlURL": control, "udn": udn, "location": location]
+    }
+
+    private func addDevice(_ dev: [String: String], to devices: inout [[String: String]], seen: inout Set<String>) {
+        let key = dev["udn"] ?? dev["controlURL"] ?? dev["location"] ?? UUID().uuidString
+        if !seen.contains(key) {
+            seen.insert(key)
+            devices.append(dev)
+        }
+    }
+
+    private func manualLocations(_ call: CAPPluginCall) -> [String] {
+        guard let location = call.getString("location")?.trimmingCharacters(in: .whitespacesAndNewlines),
+              location.hasPrefix("http://") || location.hasPrefix("https://") else {
+            return []
+        }
+        return [location]
+    }
+
+    private func manualHostPorts(_ call: CAPPluginCall) -> [(String, UInt16)] {
+        guard let host = call.getString("host")?.trimmingCharacters(in: .whitespacesAndNewlines),
+              isIPv4(host) else {
+            return []
+        }
+
+        var ports = allUPnPPorts
+        if let port = call.getInt("port"), port > 0, port < 65536 {
+            ports.insert(UInt16(port), at: 0)
+        }
+
+        var out: [(String, UInt16)] = []
+        var seen = Set<String>()
+        for port in ports {
+            let key = "\(host):\(port)"
+            if !seen.contains(key) {
+                seen.insert(key)
+                out.append((host, port))
+            }
+        }
+        return out
     }
 
     // MARK: - Control
 
     @objc func cast(_ call: CAPPluginCall) {
         guard let controlURL = call.getString("controlURL"), let mediaUrl = call.getString("url") else {
-            call.reject("controlURL and url required"); return
+            call.reject("controlURL and url required")
+            return
         }
+
         let title = call.getString("title") ?? ""
         let isM3u8 = call.getBool("isM3u8") ?? mediaUrl.contains(".m3u8")
         let mime = isM3u8 ? "application/vnd.apple.mpegurl" : (mediaUrl.contains(".mp4") ? "video/mp4" : "video/*")
+
         workQueue.async {
-            let meta = self.didl(mediaUrl, title, mime)
-            let body1 = "<InstanceID>0</InstanceID><CurrentURI>\(self.esc(mediaUrl))</CurrentURI>"
-                + "<CurrentURIMetaData>\(meta)</CurrentURIMetaData>"
-            _ = self.soap(controlURL, "SetAVTransportURI", body1)
-            // Some renderers (Xiaomi) are briefly TRANSITIONING and drop an immediate Play.
+            let metadata = self.didl(mediaUrl, title, mime)
+            let body = "<InstanceID>0</InstanceID><CurrentURI>\(self.esc(mediaUrl))</CurrentURI>"
+                + "<CurrentURIMetaData>\(metadata)</CurrentURIMetaData>"
+            _ = self.soap(controlURL, "SetAVTransportURI", body)
+
+            // Some renderers briefly enter TRANSITIONING and drop an immediate Play.
             Thread.sleep(forTimeInterval: 0.7)
-            var r = self.soap(controlURL, "Play", "<InstanceID>0</InstanceID><Speed>1</Speed>")
-            if r == nil {
+            var response = self.soap(controlURL, "Play", "<InstanceID>0</InstanceID><Speed>1</Speed>")
+            if response == nil {
                 Thread.sleep(forTimeInterval: 0.5)
-                r = self.soap(controlURL, "Play", "<InstanceID>0</InstanceID><Speed>1</Speed>")
+                response = self.soap(controlURL, "Play", "<InstanceID>0</InstanceID><Speed>1</Speed>")
             }
+
             call.resolve(["ok": true])
         }
     }
 
     @objc func stop(_ call: CAPPluginCall) {
-        guard let controlURL = call.getString("controlURL") else { call.reject("controlURL required"); return }
+        guard let controlURL = call.getString("controlURL") else {
+            call.reject("controlURL required")
+            return
+        }
         workQueue.async {
             _ = self.soap(controlURL, "Stop", "<InstanceID>0</InstanceID>")
             call.resolve(["ok": true])
         }
     }
 
-    // Transport state + current/total position — lets the UI act as a remote:
-    // confirm the TV started, drive the progress bar, and seek.
     @objc func state(_ call: CAPPluginCall) {
-        guard let controlURL = call.getString("controlURL") else { call.reject("controlURL required"); return }
+        guard let controlURL = call.getString("controlURL") else {
+            call.reject("controlURL required")
+            return
+        }
         workQueue.async {
-            let ti = self.soap(controlURL, "GetTransportInfo", "<InstanceID>0</InstanceID>") ?? ""
-            let pi = self.soap(controlURL, "GetPositionInfo", "<InstanceID>0</InstanceID>") ?? ""
+            let transportInfo = self.soap(controlURL, "GetTransportInfo", "<InstanceID>0</InstanceID>") ?? ""
+            let positionInfo = self.soap(controlURL, "GetPositionInfo", "<InstanceID>0</InstanceID>") ?? ""
             call.resolve([
-                "transportState": self.rx("<CurrentTransportState>([^<]*)</CurrentTransportState>", ti) ?? "",
-                "transportStatus": self.rx("<CurrentTransportStatus>([^<]*)</CurrentTransportStatus>", ti) ?? "",
-                "relSeconds": self.secs(self.rx("<RelTime>([^<]*)</RelTime>", pi) ?? ""),
-                "durSeconds": self.secs(self.rx("<TrackDuration>([^<]*)</TrackDuration>", pi) ?? ""),
+                "transportState": self.rx("<CurrentTransportState>([^<]*)</CurrentTransportState>", transportInfo) ?? "",
+                "transportStatus": self.rx("<CurrentTransportStatus>([^<]*)</CurrentTransportStatus>", transportInfo) ?? "",
+                "relSeconds": self.secs(self.rx("<RelTime>([^<]*)</RelTime>", positionInfo) ?? ""),
+                "durSeconds": self.secs(self.rx("<TrackDuration>([^<]*)</TrackDuration>", positionInfo) ?? ""),
             ])
         }
     }
 
     @objc func seek(_ call: CAPPluginCall) {
-        guard let controlURL = call.getString("controlURL") else { call.reject("controlURL required"); return }
+        guard let controlURL = call.getString("controlURL") else {
+            call.reject("controlURL required")
+            return
+        }
         let target = hms(call.getDouble("seconds") ?? 0)
         workQueue.async {
             _ = self.soap(controlURL, "Seek", "<InstanceID>0</InstanceID><Unit>REL_TIME</Unit><Target>\(target)</Target>")
@@ -193,13 +337,25 @@ public class DlnaCastPlugin: CAPPlugin, CAPBridgedPlugin {
     }
 
     @objc func pause(_ call: CAPPluginCall) {
-        guard let controlURL = call.getString("controlURL") else { call.reject("controlURL required"); return }
-        workQueue.async { _ = self.soap(controlURL, "Pause", "<InstanceID>0</InstanceID>"); call.resolve(["ok": true]) }
+        guard let controlURL = call.getString("controlURL") else {
+            call.reject("controlURL required")
+            return
+        }
+        workQueue.async {
+            _ = self.soap(controlURL, "Pause", "<InstanceID>0</InstanceID>")
+            call.resolve(["ok": true])
+        }
     }
 
     @objc func resume(_ call: CAPPluginCall) {
-        guard let controlURL = call.getString("controlURL") else { call.reject("controlURL required"); return }
-        workQueue.async { _ = self.soap(controlURL, "Play", "<InstanceID>0</InstanceID><Speed>1</Speed>"); call.resolve(["ok": true]) }
+        guard let controlURL = call.getString("controlURL") else {
+            call.reject("controlURL required")
+            return
+        }
+        workQueue.async {
+            _ = self.soap(controlURL, "Play", "<InstanceID>0</InstanceID><Speed>1</Speed>")
+            call.resolve(["ok": true])
+        }
     }
 
     // MARK: - SOAP / HTTP
@@ -209,29 +365,34 @@ public class DlnaCastPlugin: CAPPlugin, CAPBridgedPlugin {
         let payload = "<?xml version=\"1.0\" encoding=\"utf-8\"?>"
             + "<s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\" s:encodingStyle=\"http://schemas.xmlsoap.org/soap/encoding/\">"
             + "<s:Body><u:\(action) xmlns:u=\"urn:schemas-upnp-org:service:AVTransport:1\">\(inner)</u:\(action)></s:Body></s:Envelope>"
+
         var req = URLRequest(url: url, timeoutInterval: 6)
         req.httpMethod = "POST"
         req.setValue("text/xml; charset=\"utf-8\"", forHTTPHeaderField: "Content-Type")
         req.setValue("\"urn:schemas-upnp-org:service:AVTransport:1#\(action)\"", forHTTPHeaderField: "SOAPACTION")
         req.httpBody = payload.data(using: .utf8)
+
         let sem = DispatchSemaphore(value: 0)
-        var out: String? = nil
+        var out: String?
         URLSession.shared.dataTask(with: req) { data, _, _ in
-            if let d = data { out = String(data: d, encoding: .utf8) ?? "" }
+            if let data {
+                out = String(data: data, encoding: .utf8) ?? ""
+            }
             sem.signal()
         }.resume()
         _ = sem.wait(timeout: .now() + 7)
         return out
     }
 
-    private func httpGet(_ urlStr: String, timeout: TimeInterval = 4) -> (Int, String)? {
-        guard let url = URL(string: urlStr) else { return nil }
+    private func httpGet(_ urlString: String, timeout: TimeInterval = 4) -> (Int, String)? {
+        guard let url = URL(string: urlString) else { return nil }
         var req = URLRequest(url: url, timeoutInterval: timeout)
         req.httpMethod = "GET"
+
         let sem = DispatchSemaphore(value: 0)
-        var result: (Int, String)? = nil
-        URLSession.shared.dataTask(with: req) { data, resp, _ in
-            if let http = resp as? HTTPURLResponse {
+        var result: (Int, String)?
+        URLSession.shared.dataTask(with: req) { data, response, _ in
+            if let http = response as? HTTPURLResponse {
                 result = (http.statusCode, String(data: data ?? Data(), encoding: .utf8) ?? "")
             }
             sem.signal()
@@ -240,8 +401,6 @@ public class DlnaCastPlugin: CAPPlugin, CAPBridgedPlugin {
         return result
     }
 
-    // DIDL-Lite metadata, XML-escaped so it can sit inside the SOAP text value
-    // (matches gui/dlna.js exactly).
     private func didl(_ url: String, _ title: String, _ mime: String) -> String {
         let raw = "<DIDL-Lite xmlns=\"urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/\" "
             + "xmlns:dc=\"http://purl.org/dc/elements/1.1/\" "
@@ -256,57 +415,95 @@ public class DlnaCastPlugin: CAPPlugin, CAPBridgedPlugin {
 
     // MARK: - Helpers
 
-    // seconds -> "H:MM:SS" (UPnP REL_TIME), and "H:MM:SS" -> seconds.
-    private func hms(_ s: Double) -> String {
-        let t = max(0, Int(s.rounded()))
-        return String(format: "%d:%02d:%02d", t / 3600, (t % 3600) / 60, t % 60)
+    private func hms(_ seconds: Double) -> String {
+        let total = max(0, Int(seconds.rounded()))
+        return String(format: "%d:%02d:%02d", total / 3600, (total % 3600) / 60, total % 60)
     }
-    private func secs(_ t: String) -> Int {
-        let p = t.split(separator: ":").compactMap { Int($0) }
-        if p.count == 3 { return p[0] * 3600 + p[1] * 60 + p[2] }
-        if p.count == 2 { return p[0] * 60 + p[1] }
+
+    private func secs(_ text: String) -> Int {
+        let parts = text.split(separator: ":").compactMap { Int($0) }
+        if parts.count == 3 { return parts[0] * 3600 + parts[1] * 60 + parts[2] }
+        if parts.count == 2 { return parts[0] * 60 + parts[1] }
         return 0
     }
 
     private func esc(_ s: String) -> String {
         return s.replacingOccurrences(of: "&", with: "&amp;")
-                .replacingOccurrences(of: "<", with: "&lt;")
-                .replacingOccurrences(of: ">", with: "&gt;")
-                .replacingOccurrences(of: "\"", with: "&quot;")
-                .replacingOccurrences(of: "'", with: "&apos;")
+            .replacingOccurrences(of: "<", with: "&lt;")
+            .replacingOccurrences(of: ">", with: "&gt;")
+            .replacingOccurrences(of: "\"", with: "&quot;")
+            .replacingOccurrences(of: "'", with: "&apos;")
     }
 
     private func rx(_ pattern: String, _ s: String, group: Int = 1) -> String? {
-        guard let re = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive, .dotMatchesLineSeparators]) else { return nil }
-        let r = NSRange(s.startIndex..., in: s)
-        guard let m = re.firstMatch(in: s, range: r), m.numberOfRanges > group,
-              let gr = Range(m.range(at: group), in: s) else { return nil }
-        return String(s[gr])
+        guard let regex = try? NSRegularExpression(
+            pattern: pattern,
+            options: [.caseInsensitive, .dotMatchesLineSeparators]
+        ) else {
+            return nil
+        }
+        let range = NSRange(s.startIndex..., in: s)
+        guard let match = regex.firstMatch(in: s, range: range),
+              match.numberOfRanges > group,
+              let groupRange = Range(match.range(at: group), in: s) else {
+            return nil
+        }
+        return String(s[groupRange])
     }
 
-    // The phone's Wi-Fi /24 base (e.g. "192.168.123"), used to enumerate scan targets.
-    private func lanBase24() -> String? {
-        var ip: String? = nil
+    private func lanBases24() -> [String] {
+        var bases: [String] = []
+        var seen = Set<String>()
         var ifaddr: UnsafeMutablePointer<ifaddrs>?
+
         if getifaddrs(&ifaddr) == 0 {
-            var p = ifaddr
-            while p != nil {
-                let ifa = p!.pointee
-                if ifa.ifa_addr.pointee.sa_family == UInt8(AF_INET) {
-                    let name = String(cString: ifa.ifa_name)
-                    if name == "en0" {  // Wi-Fi
+            var pointer = ifaddr
+            while pointer != nil {
+                let interface = pointer!.pointee
+                guard let address = interface.ifa_addr else {
+                    pointer = interface.ifa_next
+                    continue
+                }
+
+                if address.pointee.sa_family == UInt8(AF_INET) {
+                    let name = String(cString: interface.ifa_name)
+                    if name == "en0" || name == "en1" || name.hasPrefix("pdp_ip") {
                         var host = [CChar](repeating: 0, count: Int(NI_MAXHOST))
-                        getnameinfo(ifa.ifa_addr, socklen_t(ifa.ifa_addr.pointee.sa_len),
-                                    &host, socklen_t(host.count), nil, 0, NI_NUMERICHOST)
-                        ip = String(cString: host)
+                        getnameinfo(
+                            address,
+                            socklen_t(address.pointee.sa_len),
+                            &host,
+                            socklen_t(host.count),
+                            nil,
+                            0,
+                            NI_NUMERICHOST
+                        )
+                        let ip = String(cString: host)
+                        if let base = base24(ip), !seen.contains(base) {
+                            seen.insert(base)
+                            bases.append(base)
+                        }
                     }
                 }
-                p = ifa.ifa_next
+                pointer = interface.ifa_next
             }
             freeifaddrs(ifaddr)
         }
-        guard let addr = ip else { return nil }
-        let parts = addr.split(separator: ".")
-        return parts.count == 4 ? "\(parts[0]).\(parts[1]).\(parts[2])" : nil
+
+        return bases
+    }
+
+    private func base24(_ ip: String) -> String? {
+        let parts = ip.split(separator: ".").compactMap { Int($0) }
+        guard parts.count == 4 else { return nil }
+        guard parts[0] > 0, parts[0] < 224, parts[0] != 127, parts[3] > 0, parts[3] < 255 else {
+            return nil
+        }
+        return "\(parts[0]).\(parts[1]).\(parts[2])"
+    }
+
+    private func isIPv4(_ ip: String) -> Bool {
+        let parts = ip.split(separator: ".").compactMap { Int($0) }
+        return parts.count == 4 && parts.allSatisfy { $0 >= 0 && $0 <= 255 }
     }
 }
