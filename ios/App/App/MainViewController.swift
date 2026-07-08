@@ -1,5 +1,6 @@
 import UIKit
 import WebKit
+import AVFoundation
 import Capacitor
 
 // App-local Capacitor plugins (NativePlayer) are NOT auto-discovered under
@@ -7,6 +8,11 @@ import Capacitor
 // Capacitor.Plugins.NativePlayer stays undefined in the WebView. Register the
 // instance explicitly here; capacitorDidLoad() runs once the bridge is ready.
 class MainViewController: CAPBridgeViewController {
+    override func viewDidLoad() {
+        configureBackgroundPlayback()
+        super.viewDidLoad()
+    }
+
     override func capacitorDidLoad() {
         bridge?.registerPluginInstance(NativePlayerPlugin())
         bridge?.registerPluginInstance(DlnaCastPlugin())
@@ -18,7 +24,18 @@ class MainViewController: CAPBridgeViewController {
     // AirPlay is handled exclusively by the native AVPlayer (NativePlayer plugin),
     // invoked only when the user taps the AirPlay button.
     override func webView(with frame: CGRect, configuration: WKWebViewConfiguration) -> WKWebView {
+        configuration.allowsInlineMediaPlayback = true
+        configuration.mediaTypesRequiringUserActionForPlayback = []
         configuration.allowsAirPlayForMediaPlayback = false
         return super.webView(with: frame, configuration: configuration)
+    }
+
+    private func configureBackgroundPlayback() {
+        do {
+            try AVAudioSession.sharedInstance().setCategory(.playback, mode: .moviePlayback)
+            try AVAudioSession.sharedInstance().setActive(true)
+        } catch {
+            // Non-fatal: NativePlayer configures the same session again before playback.
+        }
     }
 }
