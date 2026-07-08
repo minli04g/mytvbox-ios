@@ -152,10 +152,17 @@ public class NativePlayerPlugin: CAPPlugin, CAPBridgedPlugin, AVRoutePickerViewD
 
         presenter.addChild(host)
         let bounds = presenter.view.bounds
-        host.view.frame = CGRect(x: max(0, bounds.maxX - 2), y: max(0, bounds.maxY - 2), width: 2, height: 2)
-        host.view.alpha = 0.02
+        let hostWidth: CGFloat = min(160, max(96, bounds.width * 0.32))
+        let hostHeight = hostWidth * 9 / 16
+        host.view.frame = CGRect(
+            x: max(0, bounds.maxX - hostWidth - 8),
+            y: max(0, bounds.maxY - hostHeight - 8),
+            width: hostWidth,
+            height: hostHeight
+        )
+        host.view.alpha = 0.01
         host.view.isUserInteractionEnabled = false
-        presenter.view.insertSubview(host.view, at: 0)
+        presenter.view.addSubview(host.view)
         host.didMove(toParent: presenter)
 
         observeTime(of: player)
@@ -163,7 +170,7 @@ public class NativePlayerPlugin: CAPPlugin, CAPBridgedPlugin, AVRoutePickerViewD
         player.play()
         updateNowPlaying(player: player, item: item)
 
-        host.startPictureInPicture(retries: 10) { [weak self] in
+        host.startPictureInPicture(retries: 60) { [weak self] in
             guard let self = self else { return }
             self.updateNowPlaying(player: player, item: item)
             onSuccess()
@@ -503,7 +510,8 @@ private class PiPHostViewController: UIViewController, AVPictureInPictureControl
             return
         }
 
-        if controller.isPictureInPicturePossible {
+        let itemReady = playerLayer.player?.currentItem?.status == .readyToPlay
+        if itemReady && controller.isPictureInPicturePossible {
             controller.startPictureInPicture()
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.7) { [weak self] in
                 guard let self = self else { return }
@@ -519,11 +527,12 @@ private class PiPHostViewController: UIViewController, AVPictureInPictureControl
         }
 
         if retries <= 0 {
-            onFailure("Picture in Picture is not ready")
+            let itemStatus = playerLayer.player?.currentItem?.status.rawValue ?? -1
+            onFailure("Picture in Picture is not ready (item=\(itemStatus), possible=\(controller.isPictureInPicturePossible))")
             return
         }
 
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in
             self?.startPictureInPicture(retries: retries - 1, onSuccess: onSuccess, onFailure: onFailure)
         }
     }
