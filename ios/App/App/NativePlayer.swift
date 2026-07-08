@@ -482,7 +482,10 @@ private class PiPHostViewController: UIViewController, AVPictureInPictureControl
 
     func configure(player: AVPlayer) {
         playerLayer.player = player
-        let controller = AVPictureInPictureController(playerLayer: playerLayer)
+        guard let controller = AVPictureInPictureController(playerLayer: playerLayer) else {
+            pipController = nil
+            return
+        }
         controller.delegate = self
         if #available(iOS 14.2, *) {
             controller.canStartPictureInPictureAutomaticallyFromInline = true
