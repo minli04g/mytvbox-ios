@@ -2,6 +2,7 @@ import Foundation
 import UIKit
 import AVKit
 import AVFoundation
+import MediaPlayer
 import Capacitor
 
 // Native video playback for the in-app mytvbox UI.
@@ -29,9 +30,13 @@ public class NativePlayerPlugin: CAPPlugin, CAPBridgedPlugin, AVRoutePickerViewD
     private var playerVC: AVPlayerViewController?
     private var endObserver: NSObjectProtocol?
     private var interruptObserver: NSObjectProtocol?
+    private var timeObserver: Any?
+    private weak var timeObserverPlayer: AVPlayer?
+    private var remoteCommandsConfigured = false
     private var wasPlayingBeforeInterruption = false
     private var pendingPlay: (url: URL, title: String)?
     private var routePickerView: AVRoutePickerView?
+    private var nowPlayingTitle = ""
 
     @objc func play(_ call: CAPPluginCall) {
         guard let urlStr = call.getString("url"), let url = URL(string: urlStr) else {
@@ -100,6 +105,8 @@ public class NativePlayerPlugin: CAPPlugin, CAPBridgedPlugin, AVRoutePickerViewD
             try AVAudioSession.sharedInstance().setActive(true)
         } catch { /* non-fatal */ }
         observeInterruptions()
+        configureRemoteCommands()
+        nowPlayingTitle = title
 
         let item = makeItem(url: url, title: title)
         observeEnd(of: item)
@@ -107,7 +114,9 @@ public class NativePlayerPlugin: CAPPlugin, CAPBridgedPlugin, AVRoutePickerViewD
         // Already on screen → swap the item so AirPlay continues seamlessly.
         if let player = self.player, self.playerVC?.presentingViewController != nil {
             player.replaceCurrentItem(with: item)
+            observeTime(of: player)
             player.play()
+            updateNowPlaying(player: player, item: item)
             return
         }
 
@@ -122,11 +131,19 @@ public class NativePlayerPlugin: CAPPlugin, CAPBridgedPlugin, AVRoutePickerViewD
         vc.onDismiss = { [weak self] in self?.teardown() }
         vc.player = player
         vc.allowsPictureInPicturePlayback = true
+        if #available(iOS 14.2, *) {
+            vc.canStartPictureInPictureAutomaticallyFromInline = true
+        }
         vc.modalPresentationStyle = .fullScreen
         self.playerVC = vc
+        observeTime(of: player)
+        updateNowPlaying(player: player, item: item)
 
         guard let presenter = self.bridge?.viewController else { return }
-        presenter.present(vc, animated: true) { player.play() }
+        presenter.present(vc, animated: true) {
+            player.play()
+            self.updateNowPlaying(player: player, item: item)
+        }
     }
 
     // An incoming call (or any audio interruption) must pause playback — which,
@@ -161,8 +178,13 @@ public class NativePlayerPlugin: CAPPlugin, CAPBridgedPlugin, AVRoutePickerViewD
     private func teardown() {
         player?.pause()
         player?.replaceCurrentItem(with: nil)
+        if let o = timeObserver, let player = timeObserverPlayer { player.removeTimeObserver(o) }
+        timeObserver = nil
+        timeObserverPlayer = nil
         player = nil
         playerVC = nil
+        nowPlayingTitle = ""
+        MPNowPlayingInfoCenter.default().nowPlayingInfo = nil
         if let o = endObserver { NotificationCenter.default.removeObserver(o); endObserver = nil }
         if let o = interruptObserver { NotificationCenter.default.removeObserver(o); interruptObserver = nil }
         try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
@@ -201,6 +223,108 @@ public class NativePlayerPlugin: CAPPlugin, CAPBridgedPlugin, AVRoutePickerViewD
             item.externalMetadata = [meta]
         }
         return item
+    }
+
+    private func configureRemoteCommands() {
+        if remoteCommandsConfigured { return }
+        remoteCommandsConfigured = true
+
+        let center = MPRemoteCommandCenter.shared()
+        center.playCommand.isEnabled = true
+        center.pauseCommand.isEnabled = true
+        center.togglePlayPauseCommand.isEnabled = true
+        center.changePlaybackPositionCommand.isEnabled = true
+        center.skipForwardCommand.isEnabled = true
+        center.skipBackwardCommand.isEnabled = true
+        center.skipForwardCommand.preferredIntervals = [15]
+        center.skipBackwardCommand.preferredIntervals = [15]
+
+        center.playCommand.addTarget { [weak self] _ in
+            guard let self = self, let player = self.player else { return .commandFailed }
+            try? AVAudioSession.sharedInstance().setActive(true)
+            player.play()
+            self.updateNowPlaying(player: player, item: player.currentItem)
+            return .success
+        }
+
+        center.pauseCommand.addTarget { [weak self] _ in
+            guard let self = self, let player = self.player else { return .commandFailed }
+            player.pause()
+            self.updateNowPlaying(player: player, item: player.currentItem)
+            return .success
+        }
+
+        center.togglePlayPauseCommand.addTarget { [weak self] _ in
+            guard let self = self, let player = self.player else { return .commandFailed }
+            if player.rate == 0 {
+                try? AVAudioSession.sharedInstance().setActive(true)
+                player.play()
+            } else {
+                player.pause()
+            }
+            self.updateNowPlaying(player: player, item: player.currentItem)
+            return .success
+        }
+
+        center.changePlaybackPositionCommand.addTarget { [weak self] event in
+            guard let self = self,
+                  let player = self.player,
+                  let event = event as? MPChangePlaybackPositionCommandEvent else {
+                return .commandFailed
+            }
+            player.seek(to: CMTime(seconds: event.positionTime, preferredTimescale: 600)) { _ in
+                self.updateNowPlaying(player: player, item: player.currentItem)
+            }
+            return .success
+        }
+
+        center.skipForwardCommand.addTarget { [weak self] event in
+            self?.skip(by: (event as? MPSkipIntervalCommandEvent)?.interval ?? 15) ?? .commandFailed
+        }
+
+        center.skipBackwardCommand.addTarget { [weak self] event in
+            self?.skip(by: -((event as? MPSkipIntervalCommandEvent)?.interval ?? 15)) ?? .commandFailed
+        }
+    }
+
+    private func skip(by seconds: TimeInterval) -> MPRemoteCommandHandlerStatus {
+        guard let player = player else { return .commandFailed }
+        let current = player.currentTime().seconds
+        guard current.isFinite else { return .commandFailed }
+        let duration = player.currentItem?.duration.seconds ?? 0
+        let upper = duration.isFinite && duration > 0 ? duration : Double.greatestFiniteMagnitude
+        let target = min(max(current + seconds, 0), upper)
+        player.seek(to: CMTime(seconds: target, preferredTimescale: 600)) { [weak self] _ in
+            self?.updateNowPlaying(player: player, item: player.currentItem)
+        }
+        return .success
+    }
+
+    private func observeTime(of player: AVPlayer) {
+        if let o = timeObserver, let oldPlayer = timeObserverPlayer {
+            oldPlayer.removeTimeObserver(o)
+            timeObserver = nil
+            timeObserverPlayer = nil
+        }
+        timeObserver = player.addPeriodicTimeObserver(
+            forInterval: CMTime(seconds: 1, preferredTimescale: 1),
+            queue: .main
+        ) { [weak self, weak player] _ in
+            guard let self = self, let player = player else { return }
+            self.updateNowPlaying(player: player, item: player.currentItem)
+        }
+        timeObserverPlayer = player
+    }
+
+    private func updateNowPlaying(player: AVPlayer, item: AVPlayerItem?) {
+        var info = MPNowPlayingInfoCenter.default().nowPlayingInfo ?? [:]
+        if !nowPlayingTitle.isEmpty { info[MPMediaItemPropertyTitle] = nowPlayingTitle }
+        let elapsed = player.currentTime().seconds
+        if elapsed.isFinite { info[MPNowPlayingInfoPropertyElapsedPlaybackTime] = elapsed }
+        let duration = item?.duration.seconds ?? 0
+        if duration.isFinite && duration > 0 { info[MPMediaItemPropertyPlaybackDuration] = duration }
+        info[MPNowPlayingInfoPropertyPlaybackRate] = player.rate
+        MPNowPlayingInfoCenter.default().nowPlayingInfo = info
     }
 
     // Fire "ended" to JS when the current item finishes so the page can queue
