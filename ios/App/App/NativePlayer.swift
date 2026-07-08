@@ -21,6 +21,7 @@ public class NativePlayerPlugin: CAPPlugin, CAPBridgedPlugin, AVRoutePickerViewD
     public let jsName = "NativePlayer"
     public let pluginMethods: [CAPPluginMethod] = [
         CAPPluginMethod(name: "play", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "pip", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "airplayPick", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "lockLandscape", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "unlockOrientation", returnType: CAPPluginReturnPromise)
@@ -28,6 +29,7 @@ public class NativePlayerPlugin: CAPPlugin, CAPBridgedPlugin, AVRoutePickerViewD
 
     private var player: AVPlayer?
     private var playerVC: AVPlayerViewController?
+    private var pipHostVC: PiPHostViewController?
     private var endObserver: NSObjectProtocol?
     private var interruptObserver: NSObjectProtocol?
     private var timeObserver: Any?
@@ -46,6 +48,21 @@ public class NativePlayerPlugin: CAPPlugin, CAPBridgedPlugin, AVRoutePickerViewD
         let title = call.getString("title") ?? ""
         DispatchQueue.main.async { self.presentPlayer(url: url, title: title) }
         call.resolve()
+    }
+
+    @objc func pip(_ call: CAPPluginCall) {
+        guard let urlStr = call.getString("url"), let url = URL(string: urlStr) else {
+            call.reject("missing or invalid 'url'")
+            return
+        }
+        let title = call.getString("title") ?? ""
+        DispatchQueue.main.async {
+            self.startPictureInPicture(url: url, title: title) {
+                call.resolve()
+            } onFailure: { message in
+                call.reject(message)
+            }
+        }
     }
 
     // One-tap AirPlay: pop the system route picker FIRST (device list), then start
@@ -89,6 +106,70 @@ public class NativePlayerPlugin: CAPPlugin, CAPBridgedPlugin, AVRoutePickerViewD
         // Let the chosen route activate before playback starts.
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
             self.presentPlayer(url: p.url, title: p.title)
+        }
+    }
+
+    private func startPictureInPicture(
+        url: URL,
+        title: String,
+        onSuccess: @escaping () -> Void,
+        onFailure: @escaping (String) -> Void
+    ) {
+        guard AVPictureInPictureController.isPictureInPictureSupported() else {
+            onFailure("Picture in Picture is not supported on this device")
+            return
+        }
+        guard let presenter = self.bridge?.viewController else {
+            onFailure("missing presenter")
+            return
+        }
+
+        playerVC?.dismiss(animated: false)
+        playerVC = nil
+        removePipHost()
+
+        do {
+            try AVAudioSession.sharedInstance().setCategory(
+                .playback, mode: .moviePlayback, policy: .longFormVideo)
+            try AVAudioSession.sharedInstance().setActive(true)
+        } catch { /* non-fatal */ }
+        observeInterruptions()
+        configureRemoteCommands()
+        nowPlayingTitle = title
+
+        let item = makeItem(url: url, title: title)
+        observeEnd(of: item)
+
+        let player = AVPlayer(playerItem: item)
+        player.allowsExternalPlayback = true
+        player.usesExternalPlaybackWhileExternalScreenIsActive = true
+        self.player = player
+
+        let host = PiPHostViewController()
+        host.onStop = { [weak self] in self?.teardown() }
+        host.configure(player: player)
+        pipHostVC = host
+
+        presenter.addChild(host)
+        let bounds = presenter.view.bounds
+        host.view.frame = CGRect(x: max(0, bounds.maxX - 2), y: max(0, bounds.maxY - 2), width: 2, height: 2)
+        host.view.alpha = 0.02
+        host.view.isUserInteractionEnabled = false
+        presenter.view.insertSubview(host.view, at: 0)
+        host.didMove(toParent: presenter)
+
+        observeTime(of: player)
+        updateNowPlaying(player: player, item: item)
+        player.play()
+        updateNowPlaying(player: player, item: item)
+
+        host.startPictureInPicture(retries: 10) { [weak self] in
+            guard let self = self else { return }
+            self.updateNowPlaying(player: player, item: item)
+            onSuccess()
+        } onFailure: { [weak self] message in
+            self?.teardown()
+            onFailure(message)
         }
     }
 
@@ -183,11 +264,21 @@ public class NativePlayerPlugin: CAPPlugin, CAPBridgedPlugin, AVRoutePickerViewD
         timeObserverPlayer = nil
         player = nil
         playerVC = nil
+        removePipHost()
         nowPlayingTitle = ""
         MPNowPlayingInfoCenter.default().nowPlayingInfo = nil
         if let o = endObserver { NotificationCenter.default.removeObserver(o); endObserver = nil }
         if let o = interruptObserver { NotificationCenter.default.removeObserver(o); interruptObserver = nil }
         try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+    }
+
+    private func removePipHost() {
+        guard let host = pipHostVC else { return }
+        pipHostVC = nil
+        host.onStop = nil
+        host.willMove(toParent: nil)
+        host.view.removeFromSuperview()
+        host.removeFromParent()
     }
 
     // Force the app into landscape (overrides the device rotation lock) for the
@@ -366,5 +457,93 @@ private class PlayerViewController: AVPlayerViewController, AVPlayerViewControll
         inPiP = false
         // PiP closed and the full-screen UI isn't on screen → release.
         if presentingViewController == nil && view.window == nil { onDismiss?() }
+    }
+}
+
+private class PiPHostViewController: UIViewController, AVPictureInPictureControllerDelegate {
+    var onStop: (() -> Void)?
+
+    private let playerLayer = AVPlayerLayer()
+    private var pipController: AVPictureInPictureController?
+    private var startSucceeded = false
+    private var startFailed = false
+
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        view.backgroundColor = .clear
+        playerLayer.videoGravity = .resizeAspect
+        view.layer.addSublayer(playerLayer)
+    }
+
+    override func viewDidLayoutSubviews() {
+        super.viewDidLayoutSubviews()
+        playerLayer.frame = view.bounds
+    }
+
+    func configure(player: AVPlayer) {
+        playerLayer.player = player
+        let controller = AVPictureInPictureController(playerLayer: playerLayer)
+        controller.delegate = self
+        if #available(iOS 14.2, *) {
+            controller.canStartPictureInPictureAutomaticallyFromInline = true
+        }
+        pipController = controller
+    }
+
+    func startPictureInPicture(
+        retries: Int,
+        onSuccess: @escaping () -> Void,
+        onFailure: @escaping (String) -> Void
+    ) {
+        guard let controller = pipController else {
+            onFailure("Picture in Picture is not available")
+            return
+        }
+
+        if controller.isPictureInPicturePossible {
+            controller.startPictureInPicture()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.7) { [weak self] in
+                guard let self = self else { return }
+                if self.startSucceeded || controller.isPictureInPictureActive {
+                    onSuccess()
+                } else if self.startFailed {
+                    onFailure("Picture in Picture failed to start")
+                } else {
+                    onFailure("Picture in Picture did not start")
+                }
+            }
+            return
+        }
+
+        if retries <= 0 {
+            onFailure("Picture in Picture is not ready")
+            return
+        }
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in
+            self?.startPictureInPicture(retries: retries - 1, onSuccess: onSuccess, onFailure: onFailure)
+        }
+    }
+
+    func pictureInPictureControllerDidStartPictureInPicture(_ pictureInPictureController: AVPictureInPictureController) {
+        startSucceeded = true
+    }
+
+    func pictureInPictureController(
+        _ pictureInPictureController: AVPictureInPictureController,
+        failedToStartPictureInPictureWithError error: Error
+    ) {
+        startFailed = true
+    }
+
+    func pictureInPictureControllerDidStopPictureInPicture(_ pictureInPictureController: AVPictureInPictureController) {
+        onStop?()
+    }
+
+    func pictureInPictureController(
+        _ pictureInPictureController: AVPictureInPictureController,
+        restoreUserInterfaceForPictureInPictureStopWithCompletionHandler completionHandler: @escaping (Bool) -> Void
+    ) {
+        completionHandler(false)
     }
 }
