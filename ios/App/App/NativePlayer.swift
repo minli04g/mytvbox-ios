@@ -152,26 +152,29 @@ public class NativePlayerPlugin: CAPPlugin, CAPBridgedPlugin, AVRoutePickerViewD
 
         presenter.addChild(host)
         let bounds = presenter.view.bounds
-        let hostWidth: CGFloat = min(160, max(96, bounds.width * 0.32))
+        let hostWidth: CGFloat = min(220, max(150, bounds.width * 0.42))
         let hostHeight = hostWidth * 9 / 16
         host.view.frame = CGRect(
-            x: max(0, bounds.maxX - hostWidth - 8),
-            y: max(0, bounds.maxY - hostHeight - 8),
+            x: max(12, bounds.maxX - hostWidth - 14),
+            y: max(12, bounds.maxY - hostHeight - 14),
             width: hostWidth,
             height: hostHeight
         )
-        host.view.alpha = 0.01
+        host.view.alpha = 1
         host.view.isUserInteractionEnabled = false
         presenter.view.addSubview(host.view)
         host.didMove(toParent: presenter)
+        presenter.view.layoutIfNeeded()
 
         observeTime(of: player)
         updateNowPlaying(player: player, item: item)
+        player.preroll(atRate: 1.0) { _ in }
         player.play()
         updateNowPlaying(player: player, item: item)
 
         host.startPictureInPicture(retries: 60) { [weak self] in
             guard let self = self else { return }
+            host.view.isHidden = true
             self.updateNowPlaying(player: player, item: item)
             onSuccess()
         } onFailure: { [weak self] message in
@@ -477,7 +480,11 @@ private class PiPHostViewController: UIViewController, AVPictureInPictureControl
 
     override func viewDidLoad() {
         super.viewDidLoad()
-        view.backgroundColor = .clear
+        view.backgroundColor = .black
+        view.layer.cornerRadius = 10
+        view.layer.masksToBounds = true
+        view.layer.borderColor = UIColor(white: 1, alpha: 0.16).cgColor
+        view.layer.borderWidth = 1
         playerLayer.videoGravity = .resizeAspect
         view.layer.addSublayer(playerLayer)
     }
