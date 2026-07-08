@@ -115,12 +115,71 @@ public class NativePlayerPlugin: CAPPlugin, CAPBridgedPlugin, AVRoutePickerViewD
         onSuccess: @escaping () -> Void,
         onFailure: @escaping (String) -> Void
     ) {
-        // Hot path must not crash: the custom AVPictureInPictureController host
-        // is fragile across iOS versions/devices when started immediately from
-        // a WebView tap. Reuse the system AVPlayerViewController path, which
-        // provides the native PiP button plus background/lock-screen playback.
-        presentPlayer(url: url, title: title)
-        onSuccess()
+        guard AVPictureInPictureController.isPictureInPictureSupported() else {
+            onFailure("Picture in Picture is not supported on this device")
+            return
+        }
+        guard let presenter = self.bridge?.viewController else {
+            onFailure("missing presenter")
+            return
+        }
+
+        playerVC?.dismiss(animated: false)
+        playerVC = nil
+        removePipHost()
+
+        do {
+            try AVAudioSession.sharedInstance().setCategory(
+                .playback, mode: .moviePlayback, policy: .longFormVideo)
+            try AVAudioSession.sharedInstance().setActive(true)
+        } catch { /* non-fatal */ }
+        observeInterruptions()
+        configureRemoteCommands()
+        nowPlayingTitle = title
+
+        let item = makeItem(url: url, title: title)
+        observeEnd(of: item)
+
+        let player = AVPlayer(playerItem: item)
+        player.allowsExternalPlayback = true
+        player.usesExternalPlaybackWhileExternalScreenIsActive = true
+        self.player = player
+
+        let host = PiPHostViewController()
+        host.onStop = { [weak self] in self?.teardown() }
+        host.configure(player: player)
+        pipHostVC = host
+
+        presenter.addChild(host)
+        let bounds = presenter.view.bounds
+        let hostWidth: CGFloat = min(180, max(140, bounds.width * 0.34))
+        let hostHeight = hostWidth * 9 / 16
+        host.view.frame = CGRect(
+            x: max(2, bounds.maxX - hostWidth - 2),
+            y: max(2, bounds.maxY - hostHeight - 2),
+            width: hostWidth,
+            height: hostHeight
+        )
+        host.view.alpha = 0.02
+        host.view.isUserInteractionEnabled = false
+        presenter.view.addSubview(host.view)
+        host.didMove(toParent: presenter)
+        presenter.view.layoutIfNeeded()
+
+        observeTime(of: player)
+        updateNowPlaying(player: player, item: item)
+        player.play()
+        updateNowPlaying(player: player, item: item)
+
+        host.startPictureInPicture(retries: 80) { [weak self] in
+            guard let self = self else { return }
+            host.keepAliveMinimized(in: presenter.view)
+            self.updateNowPlaying(player: player, item: item)
+            onSuccess()
+        } onFailure: { [weak self] message in
+            self?.teardown()
+            onFailure(message)
+        }
     }
 
     // Set up the audio session and present the AVPlayer (shared by play + airplayPick).
@@ -432,6 +491,19 @@ private class PiPHostViewController: UIViewController, AVPictureInPictureControl
     override func viewDidLayoutSubviews() {
         super.viewDidLayoutSubviews()
         playerLayer.frame = view.bounds
+    }
+
+    func keepAliveMinimized(in parentView: UIView) {
+        let size = CGSize(width: 2, height: 2)
+        view.alpha = 0.02
+        view.frame = CGRect(
+            x: max(0, parentView.bounds.maxX - size.width),
+            y: max(0, parentView.bounds.maxY - size.height),
+            width: size.width,
+            height: size.height
+        )
+        view.setNeedsLayout()
+        view.layoutIfNeeded()
     }
 
     func configure(player: AVPlayer) {
